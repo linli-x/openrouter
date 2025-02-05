@@ -2,53 +2,136 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <title>AI Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Handsome Proxy Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
-        body { font-family: Arial, sans-serif; margin: 20px; color: #333; }
-        h1, h2 { color: #4477AA; }
-        .dashboard-section { margin-bottom: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 5px; background-color: #f9f9f9; }
-        .metrics p { margin: 5px 0; }
-        .key-balances-table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-        .key-balances-table th, .key-balances-table td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-        .key-balances-table th { background-color: #eee; }
-        .key-balances-table tbody tr:nth-child(even) { background-color: #f2f2f2; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f8f9fa;
+        }
+
+        .container {
+            max-width: 900px;
+        }
+
+        h1,
+        h2 {
+            color: #0d6efd;
+        }
+
+        .dashboard-section {
+            margin-bottom: 20px;
+            padding: 20px;
+            border-radius: 8px;
+            background-color: #fff;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+        }
+
+        .metrics p {
+            margin-bottom: 0.5rem;
+        }
+
+        .key-balances-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+
+        .key-balances-table th,
+        .key-balances-table td {
+            border: 1px solid #dee2e6;
+            padding: 8px;
+            text-align: left;
+        }
+
+        .key-balances-table th {
+            background-color: #e9ecef;
+        }
+
+        .key-balances-table tbody tr:nth-child(even) {
+            background-color: #f8f9fa;
+        }
+
+        .badge {
+            font-size: 0.8rem;
+        }
+
+        .text-muted {
+            color: #6c757d;
+        }
+        .loading-bar {
+            height: 10px;
+            background-color: #0d6efd;
+            animation: progress-animation 2s infinite linear;
+        }
+        
+        @keyframes progress-animation {
+            0% { width: 0%; }
+            50% { width: 75%; }
+            100% { width: 100%; }
+        }
     </style>
 </head>
+
 <body>
-    <h1>AI Dashboard</h1>
+    <div class="container mt-5">
+        <h1 class="text-center mb-4">Handsome Proxy Dashboard</h1>
 
-    <section class="dashboard-section metrics">
-        <h2>请求速率 & Token 使用量</h2>
-        <p><strong>每分钟请求数 (RPM):</strong> {{ rpm }}</p>
-        <p><strong>每分钟 Token 数 (TPM):</strong> {{ tpm }}</p>
-        <p><strong>每日请求数 (RPD):</strong> {{ rpd }}</p>
-        <p><strong>每日 Token 数 (TPD):</strong> {{ tpd }}</p>
-    </section>
+        <section class="dashboard-section">
+            <h2 class="mb-3">实时状态</h2>
+             <div class="loading-bar mb-3"></div>
+            <div class="row">
+                <div class="col-md-6">
+                    <div class="card">
+                        <div class="card-body">
+                            <h5 class="card-title">请求速率</h5>
+                            <p class="card-text">每分钟请求数 (RPM): <span class="badge bg-primary">{{ rpm }}</span></p>
+                            <p class="card-text">每日请求数 (RPD): <span class="badge bg-secondary">{{ rpd }}</span></p>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="card">
+                        <div class="card-body">
+                            <h5 class="card-title">Token 使用量</h5>
+                            <p class="card-text">每分钟 Token 数 (TPM): <span class="badge bg-success">{{ tpm }}</span></p>
+                            <p class="card-text">每日 Token 数 (TPD): <span class="badge bg-info">{{ tpd }}</span></p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
 
-    <section class="dashboard-section key-balances">
-        <h2>API 密钥余额</h2>
-        <table class="key-balances-table">
-            <thead>
-                <tr>
-                    <th>API 密钥 (已打码)</th>
-                    <th>余额</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for key_balance in key_balances %}
-                <tr>
-                    <td>{{ key_balance.key }}</td>
-                    <td>{{ key_balance.balance }}</td>
-                </tr>
-                {% endfor %}
-                {% if not key_balances %}
-                <tr><td colspan="2">没有可用的 API 密钥信息。</td></tr>
-                {% endif %}
-            </tbody>
-        </table>
-    </section>
+        <section class="dashboard-section">
+            <h2 class="mb-3">API 密钥余额</h2>
+            <table class="table table-striped table-hover">
+                <thead>
+                    <tr>
+                        <th>API 密钥 (已打码)</th>
+                        <th>余额</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for key_balance in key_balances %}
+                    <tr>
+                        <td>{{ key_balance.key }}</td>
+                        <td>{{ key_balance.balance }}</td>
+                    </tr>
+                    {% endfor %}
+                    {% if not key_balances %}
+                    <tr>
+                        <td colspan="2">没有可用的 API 密钥信息。</td>
+                    </tr>
+                    {% endif %}
+                </tbody>
+            </table>
+        </section>
 
-    <hr>
-    <p>Dashboard created at {{ now }}</p>
+        <p class="text-muted text-center">Dashboard created at {{ now }}</p>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 </body>
+
 </html>
