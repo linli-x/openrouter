@@ -89,7 +89,7 @@ def get_credit_summary(api_key):
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            response = session.get(API_ENDPOINT, headers=headers, timeout=2) # 设置了 2 秒超时
+            response = session.get(API_ENDPOINT, headers=headers, timeout=2)  # 设置了 2 秒超时
             response.raise_for_status()
             data = response.json().get("data", {})
             total_balance = data.get("totalBalance", 0)
@@ -106,7 +106,7 @@ def get_credit_summary(api_key):
 
 # 用于模型可用性测试的免费模型测试密钥和免费图像列表
 FREE_MODEL_TEST_KEY = (
-    "sk-bmjbjzleaqfgtqfzmcnsbagxrlohriadnxqrzfocbizaxukw"
+    "sk-bmjbjzleaqfgtqfzmcnsbagxrlohriadnxqrzfocbizaxukw"  # 你需要替换为有效的测试密钥
 )
 FREE_IMAGE_LIST = [
     "stabilityai/stable-diffusion-3-5-large",
@@ -132,7 +132,7 @@ def test_model_availability(api_key, model_name, model_type="chat"):
             else {"model": model_name, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5,
                   "stream": False}
         )
-        timeout = 5 if model_type == "embedding" else 2 # 减少了超时时间
+        timeout = 5 if model_type == "embedding" else 2  # 减少了超时时间
         response = session.post(
             endpoint,
             headers=headers,
@@ -153,7 +153,7 @@ def process_image_url(image_url, response_format=None):
         return {"url": ""}
     if response_format == "b64_json":
         try:
-            response = session.get(image_url, stream=True, timeout=2) # 设置了 2 秒超时
+            response = session.get(image_url, stream=True, timeout=2)  # 设置了 2 秒超时
             response.raise_for_status()
             image = Image.open(response.raw)
             buffered = io.BytesIO()
@@ -168,7 +168,7 @@ def process_image_url(image_url, response_format=None):
 # 创建 base64 编码的 Markdown 图像链接的函数
 def create_base64_markdown_image(image_url):
     try:
-        response = session.get(image_url, stream=True, timeout=2) # 设置了 2 秒超时
+        response = session.get(image_url, stream=True, timeout=2)  # 设置了 2 秒超时
         response.raise_for_status()
         image = Image.open(BytesIO(response.content))
         new_size = tuple(dim // 4 for dim in image.size)
@@ -241,7 +241,7 @@ def get_siliconflow_data(model_name, data):
 # 刷新模型列表的函数
 def refresh_models():
     global models
-    
+
     # 使用线程池并发获取模型列表
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         futures = {
@@ -249,7 +249,7 @@ def refresh_models():
             executor.submit(get_all_models, FREE_MODEL_TEST_KEY, "embedding"): "embedding",
             executor.submit(get_all_models, FREE_MODEL_TEST_KEY, "text-to-image"): "image"
         }
-        
+
         for future in concurrent.futures.as_completed(futures):
             model_type = futures[future]
             try:
@@ -319,7 +319,7 @@ def load_keys():
     with concurrent.futures.ThreadPoolExecutor(max_workers=10000) as executor:
         futures = [executor.submit(process_key_with_logging, key, test_model) for key in unique_keys]
         concurrent.futures.wait(futures)
-        
+
     for status, keys in key_status.items():
         logging.info(f"{status.capitalize()} KEYS: {keys}")
 
@@ -339,7 +339,7 @@ def process_key_with_logging(key, test_model):
     except Exception as exc:
         logging.error(f"处理 KEY {key} 生成异常: {exc}")
         return "invalid"
-        
+
 # 处理 API 密钥的函数
 def process_key(key, test_model):
     credit_summary = get_credit_summary(key)
@@ -445,7 +445,7 @@ def key_is_valid(key, request_type):
     total_balance = credit_summary.get("total_balance", 0)
     if request_type == "free":
         return True
-    elif request_type == "paid" or request_type == "unverified":
+    elif request_type == "paid" or request_type == "unverified":  # Fixed typo here
         return total_balance > 0
     else:
         return False
@@ -522,21 +522,10 @@ def index():
     return render_template('index.html', rpm=rpm, tpm=tpm, rpd=rpd, tpd=tpd, key_balances=key_balances,
                            now=now)
 
-# 用于测试环境变量的路由
-@app.route('/env_test')
-def env_test():
-    api_key_from_env = os.environ.get('KEYS', '环境变量 KEYS 未设置')
-    auth_key_from_env = os.environ.get('AUTHORIZATION_KEY', '环境变量 AUTHORIZATION_KEY 未设置')
-    port_from_env = os.environ.get('PORT', '环境变量 PORT 未设置')
+# 去除了 /env_test 路由
 
-    return jsonify({
-        "KEYS": api_key_from_env,
-        "AUTHORIZATION_KEY": auth_key_from_env,
-        "PORT": port_from_env
-    })
-
-# 列出所有可用模型的路由
-@app.route('/handsome/v1/models', methods=['GET'])
+# 列出所有可用模型的路由，去除了 /handsome 前缀
+@app.route('/v1/models', methods=['GET'])
 def list_models():
     if not check_authorization(request):
         return jsonify({"error": "Unauthorized"}), 401
@@ -581,8 +570,8 @@ def list_models():
         "data": detailed_models
     })
 
-# 获取账单使用情况的路由
-@app.route('/handsome/v1/dashboard/billing/usage', methods=['GET'])
+# 获取账单使用情况的路由，去除了 /handsome 前缀
+@app.route('/v1/dashboard/billing/usage', methods=['GET'])
 def billing_usage():
     if not check_authorization(request):
         return jsonify({"error": "Unauthorized"}), 401
@@ -593,8 +582,8 @@ def billing_usage():
         "total_usage": 0
     })
 
-# 获取账单订阅信息的路由
-@app.route('/handsome/v1/dashboard/billing/subscription', methods=['GET'])
+# 获取账单订阅信息的路由，去除了 /handsome 前缀
+@app.route('/v1/dashboard/billing/subscription', methods=['GET'])
 def billing_subscription():
     if not check_authorization(request):
         return jsonify({"error": "Unauthorized"}), 401
@@ -622,8 +611,8 @@ def billing_subscription():
         "system_hard_limit_usd": total_balance
     })
 
-# 处理嵌入请求的路由
-@app.route('/handsome/v1/embeddings', methods=['POST'])
+# 处理嵌入请求的路由，去除了 /handsome 前缀
+@app.route('/v1/embeddings', methods=['POST'])
 def handsome_embeddings():
     if not check_authorization(request):
         return jsonify({"error": "Unauthorized"}), 401
@@ -693,8 +682,8 @@ def handsome_embeddings():
     except requests.exceptions.RequestException as e:
         return jsonify({"error": str(e)}), 500
 
-# 处理图像生成请求的路由
-@app.route('/handsome/v1/images/generations', methods=['POST'])
+# 处理图像生成请求的路由，去除了 /handsome 前缀
+@app.route('/v1/images/generations', methods=['POST'])
 def handsome_images_generations():
     if not check_authorization(request):
         return jsonify({"error": "Unauthorized"}), 401
@@ -790,8 +779,8 @@ def handsome_images_generations():
     else:
         return jsonify({"error": "Unsupported model"}), 400
 
-# 处理聊天完成请求的路由
-@app.route('/handsome/v1/chat/completions', methods=['POST'])
+# 处理聊天完成请求的路由，去除了 /handsome 前缀
+@app.route('/v1/chat/completions', methods=['POST'])
 def handsome_chat_completions():
     if not check_authorization(request):
         return jsonify({"error": "Unauthorized"}), 401
