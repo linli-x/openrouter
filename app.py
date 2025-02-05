@@ -9,18 +9,22 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 
+# 设置时区
 os.environ['TZ'] = 'Asia/Shanghai'
 time.tzset()
+
+# 配置日志记录
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# API 端点
 API_ENDPOINT = "https://api-st.siliconflow.cn/v1/user/info"
 TEST_MODEL_ENDPOINT = "https://api-st.siliconflow.cn/v1/chat/completions"
 MODELS_ENDPOINT = "https://api-st.siliconflow.cn/v1/models"
 EMBEDDINGS_ENDPOINT = "https://api-st.siliconflow.cn/v1/embeddings"
 IMAGE_ENDPOINT = "https://api-st.siliconflow.cn/v1/images/generations"
 
-def requests_session_with_retries(
-        retries=3, backoff_factor=0.3, status_forcelist=(500, 502, 504)
-):
+# 设置请求会话，包括重试机制
+def requests_session_with_retries(retries=3, backoff_factor=0.3, status_forcelist=(500, 502, 504)):
     session = requests.Session()
     retry = Retry(
         total=retries,
@@ -40,8 +44,12 @@ def requests_session_with_retries(
     return session
 
 session = requests_session_with_retries()
+
+# 初始化 Flask 应用
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
+
+# 模型和密钥状态的全局变量
 models = {
     "text": [],
     "free_text": [],
@@ -56,14 +64,23 @@ key_status = {
     "unverified": [],
     "valid": []
 }
+
+# 用于并发执行任务的线程池
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=10000)
+
+# 模型密钥索引，用于轮询选择密钥
 model_key_indices = {}
+
+# 请求时间戳和令牌计数，用于简单的速率监控
 request_timestamps = []
 token_counts = []
 request_timestamps_day = []
 token_counts_day = []
+
+# 数据锁，用于保护共享数据结构的并发访问
 data_lock = threading.Lock()
 
+# 获取信用摘要的函数
 def get_credit_summary(api_key):
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -72,7 +89,7 @@ def get_credit_summary(api_key):
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            response = session.get(API_ENDPOINT, headers=headers, timeout=2)
+            response = session.get(API_ENDPOINT, headers=headers, timeout=2) # 设置了 2 秒超时
             response.raise_for_status()
             data = response.json().get("data", {})
             total_balance = data.get("totalBalance", 0)
@@ -87,6 +104,7 @@ def get_credit_summary(api_key):
             logging.error(f"获取额度信息失败，API Key：{api_key}，错误信息：{e}")
             return None
 
+# 用于模型可用性测试的免费模型测试密钥和免费图像列表
 FREE_MODEL_TEST_KEY = (
     "sk-bmjbjzleaqfgtqfzmcnsbagxrlohriadnxqrzfocbizaxukw"
 )
@@ -98,6 +116,7 @@ FREE_IMAGE_LIST = [
     "stabilityai/stable-diffusion-2-1"
 ]
 
+# 测试模型可用性的函数
 def test_model_availability(api_key, model_name, model_type="chat"):
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -113,7 +132,7 @@ def test_model_availability(api_key, model_name, model_type="chat"):
             else {"model": model_name, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5,
                   "stream": False}
         )
-        timeout = 10 if model_type == "embedding" else 5
+        timeout = 5 if model_type == "embedding" else 2 # 减少了超时时间
         response = session.post(
             endpoint,
             headers=headers,
@@ -128,12 +147,13 @@ def test_model_availability(api_key, model_name, model_type="chat"):
         )
         return False
 
+# 处理图像 URL 的函数
 def process_image_url(image_url, response_format=None):
     if not image_url:
         return {"url": ""}
     if response_format == "b64_json":
         try:
-            response = session.get(image_url, stream=True)
+            response = session.get(image_url, stream=True, timeout=2) # 设置了 2 秒超时
             response.raise_for_status()
             image = Image.open(response.raw)
             buffered = io.BytesIO()
@@ -145,9 +165,10 @@ def process_image_url(image_url, response_format=None):
             return {"url": image_url}
     return {"url": image_url}
 
+# 创建 base64 编码的 Markdown 图像链接的函数
 def create_base64_markdown_image(image_url):
     try:
-        response = session.get(image_url, stream=True)
+        response = session.get(image_url, stream=True, timeout=2) # 设置了 2 秒超时
         response.raise_for_status()
         image = Image.open(BytesIO(response.content))
         new_size = tuple(dim // 4 for dim in image.size)
@@ -162,6 +183,7 @@ def create_base64_markdown_image(image_url):
         logging.error(f"Error creating markdown image: {e}")
         return None
 
+# 提取用户消息内容的函数
 def extract_user_content(messages):
     user_content = ""
     for message in messages:
@@ -174,6 +196,7 @@ def extract_user_content(messages):
                         user_content += item.get("text", "") + " "
     return user_content.strip()
 
+# 获取 SiliconFlow 数据的函数
 def get_siliconflow_data(model_name, data):
     siliconflow_data = {
         "model": model_name,
@@ -215,11 +238,26 @@ def get_siliconflow_data(model_name, data):
         siliconflow_data["image_size"] = "1024x1024"
     return siliconflow_data
 
+# 刷新模型列表的函数
 def refresh_models():
     global models
-    models["text"] = get_all_models(FREE_MODEL_TEST_KEY, "chat")
-    models["embedding"] = get_all_models(FREE_MODEL_TEST_KEY, "embedding")
-    models["image"] = get_all_models(FREE_MODEL_TEST_KEY, "text-to-image")
+    
+    # 使用线程池并发获取模型列表
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            executor.submit(get_all_models, FREE_MODEL_TEST_KEY, "chat"): "text",
+            executor.submit(get_all_models, FREE_MODEL_TEST_KEY, "embedding"): "embedding",
+            executor.submit(get_all_models, FREE_MODEL_TEST_KEY, "text-to-image"): "image"
+        }
+        
+        for future in concurrent.futures.as_completed(futures):
+            model_type = futures[future]
+            try:
+                models[model_type] = future.result()
+            except Exception as exc:
+                logging.error(f"获取 {model_type} 模型列表失败: {exc}")
+                models[model_type] = []
+
     models["free_text"] = []
     models["free_embedding"] = []
     models["free_image"] = []
@@ -263,6 +301,7 @@ def refresh_models():
         logging.info(f"所有{model_type}模型列表：{models[model_type]}")
         logging.info(f"免费{model_type}模型列表：{models[f'free_{model_type}']}")
 
+# 加载 API 密钥的函数
 def load_keys():
     global key_status
     for status in key_status:
@@ -276,27 +315,32 @@ def load_keys():
     os.environ["KEYS"] = ','.join(unique_keys)
     logging.info(f"加载的 keys：{unique_keys}")
 
-    def process_key_with_logging(key):
-        try:
-            key_type = process_key(key, test_model)
-            if key_type in key_status:
-                key_status[key_type].append(key)
-            return key_type
-        except Exception as exc:
-            logging.error(f"处理 KEY {key} 生成异常: {exc}")
-            return "invalid"
-
+    # 使用线程池并发处理密钥
     with concurrent.futures.ThreadPoolExecutor(max_workers=10000) as executor:
-        futures = [executor.submit(process_key_with_logging, key) for key in unique_keys]
+        futures = [executor.submit(process_key_with_logging, key, test_model) for key in unique_keys]
         concurrent.futures.wait(futures)
+        
     for status, keys in key_status.items():
         logging.info(f"{status.capitalize()} KEYS: {keys}")
+
     global invalid_keys_global, free_keys_global, unverified_keys_global, valid_keys_global
     invalid_keys_global = key_status["invalid"]
     free_keys_global = key_status["free"]
     unverified_keys_global = key_status["unverified"]
     valid_keys_global = key_status["valid"]
 
+# 对单个密钥进行处理的辅助函数
+def process_key_with_logging(key, test_model):
+    try:
+        key_type = process_key(key, test_model)
+        if key_type in key_status:
+            key_status[key_type].append(key)
+        return key_type
+    except Exception as exc:
+        logging.error(f"处理 KEY {key} 生成异常: {exc}")
+        return "invalid"
+        
+# 处理 API 密钥的函数
 def process_key(key, test_model):
     credit_summary = get_credit_summary(key)
     if credit_summary is None:
@@ -311,6 +355,7 @@ def process_key(key, test_model):
             else:
                 return "unverified"
 
+# 获取所有模型列表的函数
 def get_all_models(api_key, sub_type):
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -349,6 +394,7 @@ def get_all_models(api_key, sub_type):
         )
         return []
 
+# 确定请求类型的函数
 def determine_request_type(model_name, model_list, free_model_list):
     if model_name in free_model_list:
         return "free"
@@ -357,6 +403,7 @@ def determine_request_type(model_name, model_list, free_model_list):
     else:
         return "unknown"
 
+# 选择 API 密钥的函数
 def select_key(request_type, model_name):
     if request_type == "free":
         available_keys = (
@@ -388,6 +435,7 @@ def select_key(request_type, model_name):
     model_key_indices[model_name] = 0
     return None
 
+# 检查 API 密钥是否有效的函数
 def key_is_valid(key, request_type):
     if request_type == "invalid":
         return False
@@ -397,11 +445,12 @@ def key_is_valid(key, request_type):
     total_balance = credit_summary.get("total_balance", 0)
     if request_type == "free":
         return True
-    elif request_type == "paid" or request_type == "unverified":  # Fixed typo here
+    elif request_type == "paid" or request_type == "unverified":
         return total_balance > 0
     else:
         return False
 
+# 检查请求授权的函数
 def check_authorization(request):
     authorization_key = os.environ.get("AUTHORIZATION_KEY")
     if not authorization_key:
@@ -416,6 +465,7 @@ def check_authorization(request):
         return False
     return True
 
+# 对 API 密钥进行打码处理的函数
 def obfuscate_key(key):
     if not key:
         return "****"
@@ -428,11 +478,13 @@ def obfuscate_key(key):
     masked_part = "*" * (len(key) - prefix_length - suffix_length)
     return prefix + masked_part + suffix
 
+# 设置后台调度器，用于定期加载密钥和刷新模型列表
 scheduler = BackgroundScheduler()
 scheduler.add_job(load_keys, 'interval', hours=1)
 scheduler.remove_all_jobs()
 scheduler.add_job(refresh_models, 'interval', hours=1)
 
+# Flask 应用的路由定义
 @app.route('/')
 def index():
     current_time = time.time()
@@ -451,8 +503,9 @@ def index():
         rpd = len(request_timestamps_day)
         tpd = sum(token_counts_day)
 
+    # 并发获取所有密钥的余额信息
     key_balances = []
-    all_keys = list(chain(*key_status.values()))  # Get all keys from all statuses
+    all_keys = list(chain(*key_status.values()))
     with concurrent.futures.ThreadPoolExecutor(max_workers=10000) as executor:
         future_to_key = {executor.submit(get_credit_summary, key): key for key in all_keys}
         for future in concurrent.futures.as_completed(future_to_key):
@@ -465,10 +518,11 @@ def index():
                 logging.error(f"获取 KEY {obfuscate_key(key)} 余额信息失败: {exc}")
                 key_balances.append({"key": obfuscate_key(key), "balance": "获取失败"})
 
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # Get current time for display
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return render_template('index.html', rpm=rpm, tpm=tpm, rpd=rpd, tpd=tpd, key_balances=key_balances,
-                           now=now)  # Render template instead of jsonify
+                           now=now)
 
+# 用于测试环境变量的路由
 @app.route('/env_test')
 def env_test():
     api_key_from_env = os.environ.get('KEYS', '环境变量 KEYS 未设置')
@@ -481,6 +535,7 @@ def env_test():
         "PORT": port_from_env
     })
 
+# 列出所有可用模型的路由
 @app.route('/handsome/v1/models', methods=['GET'])
 def list_models():
     if not check_authorization(request):
@@ -526,6 +581,7 @@ def list_models():
         "data": detailed_models
     })
 
+# 获取账单使用情况的路由
 @app.route('/handsome/v1/dashboard/billing/usage', methods=['GET'])
 def billing_usage():
     if not check_authorization(request):
@@ -537,15 +593,14 @@ def billing_usage():
         "total_usage": 0
     })
 
+# 获取账单订阅信息的路由
 @app.route('/handsome/v1/dashboard/billing/subscription', methods=['GET'])
 def billing_subscription():
     if not check_authorization(request):
         return jsonify({"error": "Unauthorized"}), 401
     keys = valid_keys_global + unverified_keys_global
     total_balance = 0
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=10000
-    ) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10000) as executor:
         futures = [
             executor.submit(get_credit_summary, key) for key in keys
         ]
@@ -567,6 +622,7 @@ def billing_subscription():
         "system_hard_limit_usd": total_balance
     })
 
+# 处理嵌入请求的路由
 @app.route('/handsome/v1/embeddings', methods=['POST'])
 def handsome_embeddings():
     if not check_authorization(request):
@@ -637,6 +693,7 @@ def handsome_embeddings():
     except requests.exceptions.RequestException as e:
         return jsonify({"error": str(e)}), 500
 
+# 处理图像生成请求的路由
 @app.route('/handsome/v1/images/generations', methods=['POST'])
 def handsome_images_generations():
     if not check_authorization(request):
@@ -733,6 +790,7 @@ def handsome_images_generations():
     else:
         return jsonify({"error": "Unsupported model"}), 400
 
+# 处理聊天完成请求的路由
 @app.route('/handsome/v1/chat/completions', methods=['POST'])
 def handsome_chat_completions():
     if not check_authorization(request):
@@ -1436,7 +1494,7 @@ def handsome_chat_completions():
             logging.error(f"请求转发异常: {e}")
             return jsonify({"error": str(e)}), 500
 
-# 在 if __name__ == '__main__': 块外定义
+# 初始化代码
 load_keys()
 logging.info("程序启动时首次加载 keys 已执行")
 scheduler.start()
@@ -1445,11 +1503,6 @@ refresh_models()
 logging.info("首次刷新模型列表已手动触发执行")
 
 if __name__ == '__main__':
-    # logging.info(f"环境变量：{os.environ}") # 移动到前面
-    # load_keys()
-    # logging.info("程序启动时首次加载 keys 已执行")
-    # scheduler.start()
-    # logging.info("首次加载 keys 已手动触发执行")
-    # refresh_models()
-    # logging.info("首次刷新模型列表已手动触发执行")
+    # 注意：在 Vercel 上部署时，不需要 app.run()。
+    # 这里保留 app.run 是为了方便本地调试
     app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 7860)))
