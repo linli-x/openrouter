@@ -6,7 +6,7 @@
       "use": "@vercel/python",
       "config": {
         "maxLambdaSize": "50mb",
-        "runtime": "python3.10"  // 或者你需要的 Python 版本
+        "runtime": "python3.10"
       }
     }
   ],
