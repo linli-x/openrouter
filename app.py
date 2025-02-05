@@ -1,49 +1,47 @@
-import os
-import time
-import logging
-import requests
-import json
-import uuid
-import concurrent.futures
-import threading
-import base64
-import io
+import os, time, logging, requests, json, uuid, concurrent.futures, threading, base64, io
 from io import BytesIO
 from itertools import chain
 from PIL import Image
-import datetime
+from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, request, jsonify, Response, stream_with_context, render_template
 from werkzeug.middleware.proxy_fix import ProxyFix
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 
-# 设置时区及日志
 os.environ['TZ'] = 'Asia/Shanghai'
 time.tzset()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# API 端点
 API_ENDPOINT = "https://api-st.siliconflow.cn/v1/user/info"
 TEST_MODEL_ENDPOINT = "https://api-st.siliconflow.cn/v1/chat/completions"
 MODELS_ENDPOINT = "https://api-st.siliconflow.cn/v1/models"
 EMBEDDINGS_ENDPOINT = "https://api-st.siliconflow.cn/v1/embeddings"
 IMAGE_ENDPOINT = "https://api-st.siliconflow.cn/v1/images/generations"
 
-def requests_session_with_retries(retries=3, backoff_factor=0.3, status_forcelist=(500, 502, 504)):
+def requests_session_with_retries(
+        retries=3, backoff_factor=0.3, status_forcelist=(500, 502, 504)
+):
     session = requests.Session()
-    retry = Retry(total=retries, read=retries, connect=retries, backoff_factor=backoff_factor, status_forcelist=status_forcelist)
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=1000, pool_maxsize=10000, pool_block=False)
+    retry = Retry(
+        total=retries,
+        read=retries,
+        connect=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=status_forcelist,
+    )
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=1000,
+        pool_maxsize=10000,
+        pool_block=False
+    )
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
 
 session = requests_session_with_retries()
-
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
-
-# 定义全局数据结构
 models = {
     "text": [],
     "free_text": [],
@@ -60,15 +58,17 @@ key_status = {
 }
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=10000)
 model_key_indices = {}
-request_timestamps = []  # 每分钟请求时间戳
-token_counts = []        # 每分钟 token 数
-request_timestamps_day = []  # 每日请求时间戳
-token_counts_day = []        # 每日 token 数
+request_timestamps = []
+token_counts = []
+request_timestamps_day = []
+token_counts_day = []
 data_lock = threading.Lock()
 
-# 获取某个 API KEY 的额度
 def get_credit_summary(api_key):
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -79,14 +79,17 @@ def get_credit_summary(api_key):
             logging.info(f"获取额度，API Key：{api_key}，当前额度: {total_balance}")
             return {"total_balance": float(total_balance)}
         except requests.exceptions.Timeout as e:
-            logging.error(f"获取额度信息失败，API Key：{api_key}，第 {attempt+1}/{max_retries} 次错误：{e} (Timeout)")
+            logging.error(
+                f"获取额度信息失败，API Key：{api_key}，尝试次数：{attempt + 1}/{max_retries}，错误信息：{e} (Timeout)")
             if attempt >= max_retries - 1:
-                logging.error(f"API Key：{api_key} 重试所有次数均失败 (Timeout)")
+                logging.error(f"获取额度信息失败，API Key：{api_key}，所有重试次数均已失败 (Timeout)")
         except requests.exceptions.RequestException as e:
-            logging.error(f"获取额度失败，API Key：{api_key}，错误：{e}")
+            logging.error(f"获取额度信息失败，API Key：{api_key}，错误信息：{e}")
             return None
 
-FREE_MODEL_TEST_KEY = "sk-bmjbjzleaqfgtqfzmcnsbagxrlohriadnxqrzfocbizaxukw"
+FREE_MODEL_TEST_KEY = (
+    "sk-bmjbjzleaqfgtqfzmcnsbagxrlohriadnxqrzfocbizaxukw"
+)
 FREE_IMAGE_LIST = [
     "stabilityai/stable-diffusion-3-5-large",
     "black-forest-labs/FLUX.1-schnell",
@@ -96,21 +99,33 @@ FREE_IMAGE_LIST = [
 ]
 
 def test_model_availability(api_key, model_name, model_type="chat"):
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
     if model_type == "image":
         return model_name in FREE_IMAGE_LIST
     try:
         endpoint = EMBEDDINGS_ENDPOINT if model_type == "embedding" else TEST_MODEL_ENDPOINT
-        if model_type == "embedding":
-            payload = {"model": model_name, "input": ["hi"]}
-            timeout = 10
-        else:
-            payload = {"model": model_name, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5, "stream": False}
-            timeout = 5
-        response = session.post(endpoint, headers=headers, json=payload, timeout=timeout)
+        payload = (
+            {"model": model_name, "input": ["hi"]}
+            if model_type == "embedding"
+            else {"model": model_name, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5,
+                  "stream": False}
+        )
+        timeout = 10 if model_type == "embedding" else 5
+        response = session.post(
+            endpoint,
+            headers=headers,
+            json=payload,
+            timeout=timeout
+        )
         return response.status_code in [200, 429]
     except requests.exceptions.RequestException as e:
-        logging.error(f"测试 {model_type} 模型 {model_name} 可用性失败，API Key：{api_key}，错误：{e}")
+        logging.error(
+            f"测试{model_type}模型 {model_name} 可用性失败，"
+            f"API Key：{api_key}，错误信息：{e}"
+        )
         return False
 
 def process_image_url(image_url, response_format=None):
@@ -141,30 +156,33 @@ def create_base64_markdown_image(image_url):
         resized_image.save(buffered, format="PNG")
         base64_encoded = base64.b64encode(buffered.getvalue()).decode('utf-8')
         markdown_image_link = f"![](data:image/png;base64,{base64_encoded})"
-        logging.info("成功生成 Markdown 格式 Base64 图片。")
+        logging.info("Created base64 markdown image link.")
         return markdown_image_link
     except Exception as e:
-        logging.error(f"生成 Markdown 图片失败: {e}")
+        logging.error(f"Error creating markdown image: {e}")
         return None
 
 def extract_user_content(messages):
     user_content = ""
     for message in messages:
-        if message.get("role") == "user":
-            if isinstance(message.get("content"), str):
+        if message["role"] == "user":
+            if isinstance(message["content"], str):
                 user_content += message["content"] + " "
-            elif isinstance(message.get("content"), list):
+            elif isinstance(message["content"], list):
                 for item in message["content"]:
                     if isinstance(item, dict) and item.get("type") == "text":
                         user_content += item.get("text", "") + " "
     return user_content.strip()
 
 def get_siliconflow_data(model_name, data):
-    siliconflow_data = {"model": model_name, "prompt": data.get("prompt") or ""}
+    siliconflow_data = {
+        "model": model_name,
+        "prompt": data.get("prompt") or "",
+    }
     if model_name == "black-forest-labs/FLUX.1-pro":
         siliconflow_data.update({
-            "width": max(256, min(1440, (data.get("width", 1024)//32)*32)),
-            "height": max(256, min(1440, (data.get("height", 768)//32)*32)),
+            "width": max(256, min(1440, (data.get("width", 1024) // 32) * 32)),
+            "height": max(256, min(1440, (data.get("height", 768) // 32) * 32)),
             "prompt_upsampling": data.get("prompt_upsampling", False),
             "image_prompt": data.get("image_prompt"),
             "steps": max(1, min(50, data.get("steps", 20))),
@@ -191,7 +209,8 @@ def get_siliconflow_data(model_name, data):
                 "guidance_scale": max(0, min(100, data.get("guidance_scale", 7.5))),
                 "negative_prompt": data.get("negative_prompt")
             })
-    valid_sizes = ["1024x1024", "512x1024", "768x512", "768x1024", "1024x576", "576x1024", "960x1280", "720x1440", "720x1280"]
+    valid_sizes = ["1024x1024", "512x1024", "768x512", "768x1024", "1024x576", "576x1024", "960x1280", "720x1440",
+                   "720x1280"]
     if "image_size" in siliconflow_data and siliconflow_data["image_size"] not in valid_sizes:
         siliconflow_data["image_size"] = "1024x1024"
     return siliconflow_data
@@ -213,16 +232,24 @@ def refresh_models():
                 logging.warning("环境变量 BAN_MODELS 格式不正确，应为 JSON 数组。")
                 ban_models = []
         except json.JSONDecodeError:
-            logging.warning("解析环境变量 BAN_MODELS 失败。")
+            logging.warning("环境变量 BAN_MODELS JSON 解析失败，请检查格式。")
     models["text"] = [model for model in models["text"] if model not in ban_models]
     models["embedding"] = [model for model in models["embedding"] if model not in ban_models]
     models["image"] = [model for model in models["image"] if model not in ban_models]
-    model_types = [("text", "chat"), ("embedding", "embedding"), ("image", "image")]
+    model_types = [
+        ("text", "chat"),
+        ("embedding", "embedding"),
+        ("image", "image")
+    ]
     for model_type, test_type in model_types:
         with concurrent.futures.ThreadPoolExecutor(max_workers=10000) as executor:
             future_to_model = {
-                executor.submit(test_model_availability, FREE_MODEL_TEST_KEY, model, test_type): model
-                for model in models[model_type]
+                executor.submit(
+                    test_model_availability,
+                    FREE_MODEL_TEST_KEY,
+                    model,
+                    test_type
+                ): model for model in models[model_type]
             }
             for future in concurrent.futures.as_completed(future_to_model):
                 model = future_to_model[future]
@@ -231,10 +258,10 @@ def refresh_models():
                     if is_free:
                         models[f"free_{model_type}"].append(model)
                 except Exception as exc:
-                    logging.error(f"{model_type} 模型 {model} 测试失败: {exc}")
+                    logging.error(f"{model_type}模型 {model} 测试生成异常: {exc}")
     for model_type in ["text", "embedding", "image"]:
-        logging.info(f"所有 {model_type} 模型：{models[model_type]}")
-        logging.info(f"免费 {model_type} 模型：{models[f'free_{model_type}']}")
+        logging.info(f"所有{model_type}模型列表：{models[model_type]}")
+        logging.info(f"免费{model_type}模型列表：{models[f'free_{model_type}']}")
 
 def load_keys():
     global key_status
@@ -247,7 +274,8 @@ def load_keys():
     test_model = os.environ.get("TEST_MODEL", "Pro/google/gemma-2-9b-it")
     unique_keys = list(set(key.strip() for key in keys_str.split(',')))
     os.environ["KEYS"] = ','.join(unique_keys)
-    logging.info(f"加载的 KEYS: {unique_keys}")
+    logging.info(f"加载的 keys：{unique_keys}")
+
     def process_key_with_logging(key):
         try:
             key_type = process_key(key, test_model)
@@ -255,8 +283,9 @@ def load_keys():
                 key_status[key_type].append(key)
             return key_type
         except Exception as exc:
-            logging.error(f"处理 KEY {key} 异常: {exc}")
+            logging.error(f"处理 KEY {key} 生成异常: {exc}")
             return "invalid"
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=10000) as executor:
         futures = [executor.submit(process_key_with_logging, key) for key in unique_keys]
         concurrent.futures.wait(futures)
@@ -283,21 +312,41 @@ def process_key(key, test_model):
                 return "unverified"
 
 def get_all_models(api_key, sub_type):
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
     try:
-        response = session.get(MODELS_ENDPOINT, headers=headers, params={"sub_type": sub_type})
+        response = session.get(
+            MODELS_ENDPOINT,
+            headers=headers,
+            params={"sub_type": sub_type}
+        )
         response.raise_for_status()
         data = response.json()
-        if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
-            return [model.get("id") for model in data["data"] if isinstance(model, dict) and "id" in model]
+        if (
+                isinstance(data, dict) and
+                'data' in data and
+                isinstance(data['data'], list)
+        ):
+            return [
+                model.get("id") for model in data["data"]
+                if isinstance(model, dict) and "id" in model
+            ]
         else:
-            logging.error("获取模型列表失败：响应格式错误")
+            logging.error("获取模型列表失败：响应数据格式不正确")
             return []
     except requests.exceptions.RequestException as e:
-        logging.error(f"获取模型列表失败，API Key：{api_key}，错误：{e}")
+        logging.error(
+            f"获取模型列表失败，"
+            f"API Key：{api_key}，错误信息：{e}"
+        )
         return []
     except (KeyError, TypeError) as e:
-        logging.error(f"解析模型列表失败，API Key：{api_key}，错误：{e}")
+        logging.error(
+            f"解析模型列表失败，"
+            f"API Key：{api_key}，错误信息：{e}"
+        )
         return []
 
 def determine_request_type(model_name, model_list, free_model_list):
@@ -310,11 +359,19 @@ def determine_request_type(model_name, model_list, free_model_list):
 
 def select_key(request_type, model_name):
     if request_type == "free":
-        available_keys = free_keys_global + unverified_keys_global + valid_keys_global
+        available_keys = (
+                free_keys_global +
+                unverified_keys_global +
+                valid_keys_global
+        )
     elif request_type == "paid":
         available_keys = unverified_keys_global + valid_keys_global
     else:
-        available_keys = free_keys_global + unverified_keys_global + valid_keys_global
+        available_keys = (
+                free_keys_global +
+                unverified_keys_global +
+                valid_keys_global
+        )
     if not available_keys:
         return None
     current_index = model_key_indices.get(model_name, 0)
@@ -325,7 +382,9 @@ def select_key(request_type, model_name):
             model_key_indices[model_name] = current_index
             return key
         else:
-            logging.warning(f"KEY {key} 无效或达到限制，尝试下一个")
+            logging.warning(
+                f"KEY {key} 无效或达到限制，尝试下一个 KEY"
+            )
     model_key_indices[model_name] = 0
     return None
 
@@ -338,7 +397,7 @@ def key_is_valid(key, request_type):
     total_balance = credit_summary.get("total_balance", 0)
     if request_type == "free":
         return True
-    elif request_type in ["paid", "unverified"]:
+    elif request_type == "paid" or request_type == "unverified":  # Fixed typo here
         return total_balance > 0
     else:
         return False
@@ -346,11 +405,11 @@ def key_is_valid(key, request_type):
 def check_authorization(request):
     authorization_key = os.environ.get("AUTHORIZATION_KEY")
     if not authorization_key:
-        logging.warning("环境变量 AUTHORIZATION_KEY 未设置，暂不鉴权")
+        logging.warning("环境变量 AUTHORIZATION_KEY 未设置，此时无需鉴权即可使用，建议进行设置后再使用。")
         return True
-    auth_header = request.headers.get("Authorization")
+    auth_header = request.headers.get('Authorization')
     if not auth_header:
-        logging.warning("请求头缺少 Authorization 字段")
+        logging.warning("请求头中缺少 Authorization 字段。")
         return False
     if auth_header != f"Bearer {authorization_key}":
         logging.warning(f"无效的 Authorization 密钥：{auth_header}")
@@ -363,18 +422,18 @@ def obfuscate_key(key):
     prefix_length = 6
     suffix_length = 4
     if len(key) <= prefix_length + suffix_length:
-        return "****"
+        return "****"  # If key is too short, just mask it all
     prefix = key[:prefix_length]
     suffix = key[-suffix_length:]
     masked_part = "*" * (len(key) - prefix_length - suffix_length)
     return prefix + masked_part + suffix
 
 scheduler = BackgroundScheduler()
-scheduler.add_job(load_keys, "interval", hours=1)
+scheduler.add_job(load_keys, 'interval', hours=1)
 scheduler.remove_all_jobs()
-scheduler.add_job(refresh_models, "interval", hours=1)
+scheduler.add_job(refresh_models, 'interval', hours=1)
 
-@app.route("/")
+@app.route('/')
 def index():
     current_time = time.time()
     one_minute_ago = current_time - 60
@@ -391,8 +450,9 @@ def index():
             token_counts_day.pop(0)
         rpd = len(request_timestamps_day)
         tpd = sum(token_counts_day)
+
     key_balances = []
-    all_keys = list(chain(*key_status.values()))
+    all_keys = list(chain(*key_status.values()))  # Get all keys from all statuses
     with concurrent.futures.ThreadPoolExecutor(max_workers=10000) as executor:
         future_to_key = {executor.submit(get_credit_summary, key): key for key in all_keys}
         for future in concurrent.futures.as_completed(future_to_key):
@@ -402,20 +462,22 @@ def index():
                 balance = credit_summary.get("total_balance") if credit_summary else "获取失败"
                 key_balances.append({"key": obfuscate_key(key), "balance": balance})
             except Exception as exc:
-                logging.error(f"获取 KEY {obfuscate_key(key)} 异常: {exc}")
+                logging.error(f"获取 KEY {obfuscate_key(key)} 余额信息失败: {exc}")
                 key_balances.append({"key": obfuscate_key(key), "balance": "获取失败"})
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return render_template("index.html", rpm=rpm, tpm=tpm, rpd=rpd, tpd=tpd, key_balances=key_balances, now=now)
 
-# 用于测试环境变量是否正确加载
-@app.route("/env_test")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # Get current time for display
+    return render_template('index.html', rpm=rpm, tpm=tpm, rpd=rpd, tpd=tpd, key_balances=key_balances,
+                           now=now)  # Render template instead of jsonify
+
+@app.route('/env_test')
 def env_test():
-    api_key_from_env = os.environ.get("KEYS", "环境变量 KEYS 未设置")
-    authorization_key_from_env = os.environ.get("AUTHORIZATION_KEY", "环境变量 AUTHORIZATION_KEY 未设置")
-    port_from_env = os.environ.get("PORT", "环境变量 PORT 未设置")
+    api_key_from_env = os.environ.get('KEYS', '环境变量 KEYS 未设置')
+    auth_key_from_env = os.environ.get('AUTHORIZATION_KEY', '环境变量 AUTHORIZATION_KEY 未设置')
+    port_from_env = os.environ.get('PORT', '环境变量 PORT 未设置')
+
     return jsonify({
         "KEYS": api_key_from_env,
-        "AUTHORIZATION_KEY": authorization_key_from_env,
+        "AUTHORIZATION_KEY": auth_key_from_env,
         "PORT": port_from_env
     })
 
@@ -463,6 +525,7 @@ def list_models():
         "success": True,
         "data": detailed_models
     })
+
 @app.route('/handsome/v1/dashboard/billing/usage', methods=['GET'])
 def billing_usage():
     if not check_authorization(request):
@@ -473,6 +536,7 @@ def billing_usage():
         "data": daily_usage,
         "total_usage": 0
     })
+
 @app.route('/handsome/v1/dashboard/billing/subscription', methods=['GET'])
 def billing_subscription():
     if not check_authorization(request):
@@ -480,7 +544,7 @@ def billing_subscription():
     keys = valid_keys_global + unverified_keys_global
     total_balance = 0
     with concurrent.futures.ThreadPoolExecutor(
-        max_workers=10000
+            max_workers=10000
     ) as executor:
         futures = [
             executor.submit(get_credit_summary, key) for key in keys
@@ -502,6 +566,7 @@ def billing_subscription():
         "hard_limit_usd": total_balance,
         "system_hard_limit_usd": total_balance
     })
+
 @app.route('/handsome/v1/embeddings', methods=['POST'])
 def handsome_embeddings():
     if not check_authorization(request):
@@ -519,7 +584,8 @@ def handsome_embeddings():
     )
     api_key = select_key(request_type, model_name)
     if not api_key:
-        return jsonify({"error": ("No available API key for this request type or all keys have reached their limits")}), 429
+        return jsonify(
+            {"error": ("No available API key for this request type or all keys have reached their limits")}), 429
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
@@ -570,6 +636,7 @@ def handsome_embeddings():
         })
     except requests.exceptions.RequestException as e:
         return jsonify({"error": str(e)}), 500
+
 @app.route('/handsome/v1/images/generations', methods=['POST'])
 def handsome_images_generations():
     if not check_authorization(request):
@@ -587,13 +654,17 @@ def handsome_images_generations():
     )
     api_key = select_key(request_type, model_name)
     if not api_key:
-        return jsonify({"error": ("No available API key for this request type or all keys have reached their limits")}), 429
+        return jsonify(
+            {"error": ("No available API key for this request type or all keys have reached their limits")}), 429
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
     response_data = {}
-    if "stable-diffusion" in model_name or model_name in ["black-forest-labs/FLUX.1-schnell", "Pro/black-forest-labs/FLUX.1-schnell","black-forest-labs/FLUX.1-dev", "black-forest-labs/FLUX.1-pro"]:
+    if "stable-diffusion" in model_name or model_name in ["black-forest-labs/FLUX.1-schnell",
+                                                          "Pro/black-forest-labs/FLUX.1-schnell",
+                                                          "black-forest-labs/FLUX.1-dev",
+                                                          "black-forest-labs/FLUX.1-pro"]:
         siliconflow_data = get_siliconflow_data(model_name, data)
         try:
             start_time = time.time()
@@ -617,14 +688,14 @@ def handsome_images_generations():
                         image_url = item["url"]
                         print(f"image_url: {image_url}")
                         if data.get("response_format") == "b64_json":
-                           try:
+                            try:
                                 image_data = session.get(image_url, stream=True).raw
                                 image = Image.open(image_data)
                                 buffered = io.BytesIO()
                                 image.save(buffered, format="PNG")
                                 img_str = base64.b64encode(buffered.getvalue()).decode()
                                 openai_images.append({"b64_json": img_str})
-                           except Exception as e:
+                            except Exception as e:
                                 logging.error(f"图片转base64失败: {e}")
                                 openai_images.append({"url": image_url})
                         else:
@@ -661,6 +732,7 @@ def handsome_images_generations():
             return jsonify({"error": str(e)}), 500
     else:
         return jsonify({"error": "Unsupported model"}), 400
+
 @app.route('/handsome/v1/chat/completions', methods=['POST'])
 def handsome_chat_completions():
     if not check_authorization(request):
@@ -761,20 +833,20 @@ def handsome_chat_completions():
                             try:
                                 response_json = json.loads(line)
                                 if (
-                                    "usage" in response_json and
-                                    "completion_tokens" in response_json["usage"]
+                                        "usage" in response_json and
+                                        "completion_tokens" in response_json["usage"]
                                 ):
                                     completion_tokens += response_json[
                                         "usage"
                                     ]["completion_tokens"]
                                 if (
-                                    "usage" in response_json and
-                                    "prompt_tokens" in response_json["usage"]
+                                        "usage" in response_json and
+                                        "prompt_tokens" in response_json["usage"]
                                 ):
                                     prompt_tokens = response_json[
                                         "usage"
                                     ]["prompt_tokens"]
-                            except ( KeyError,ValueError,IndexError) as e:
+                            except (KeyError, ValueError, IndexError) as e:
                                 pass
                     user_content = ""
                     messages = data.get("messages", [])
@@ -785,18 +857,19 @@ def handsome_chat_completions():
                             elif isinstance(message["content"], list):
                                 for item in message["content"]:
                                     if (
-                                        isinstance(item, dict) and
-                                        item.get("type") == "text"
+                                            isinstance(item, dict) and
+                                            item.get("type") == "text"
                                     ):
                                         user_content += (
-                                            item.get("text", "") +
-                                            " "
+                                                item.get("text", "") +
+                                                " "
                                         )
                     user_content = user_content.strip()
                     user_content_replaced = user_content.replace(
                         '\n', '\\n'
                     ).replace('\r', '\\n')
-                    response_content_replaced = (f"```Thinking\n{reasoning_content_accumulated}\n```\n" if reasoning_content_accumulated else "") + content_accumulated
+                    response_content_replaced = (
+                                                            f"```Thinking\n{reasoning_content_accumulated}\n```\n" if reasoning_content_accumulated else "") + content_accumulated
                     response_content_replaced = response_content_replaced.replace(
                         '\n', '\\n'
                     ).replace('\r', '\\n')
@@ -850,8 +923,8 @@ def handsome_chat_completions():
                                     continue
                 end_time = time.time()
                 first_token_time = (
-                    first_chunk_time - start_time
-                    if first_chunk_time else 0
+                        first_chunk_time - start_time
+                        if first_chunk_time else 0
                 )
                 total_time = end_time - start_time
                 prompt_tokens = 0
@@ -864,20 +937,20 @@ def handsome_chat_completions():
                         try:
                             response_json = json.loads(line)
                             if (
-                                "usage" in response_json and
-                                "completion_tokens" in response_json["usage"]
+                                    "usage" in response_json and
+                                    "completion_tokens" in response_json["usage"]
                             ):
                                 completion_tokens += response_json[
                                     "usage"
                                 ]["completion_tokens"]
                             if (
-                                "usage" in response_json and
-                                "prompt_tokens" in response_json["usage"]
+                                    "usage" in response_json and
+                                    "prompt_tokens" in response_json["usage"]
                             ):
                                 prompt_tokens = response_json[
                                     "usage"
                                 ]["prompt_tokens"]
-                        except (KeyError,ValueError,IndexError) as e:
+                        except (KeyError, ValueError, IndexError) as e:
                             pass
                 user_content = ""
                 messages = data.get("messages", [])
@@ -888,18 +961,19 @@ def handsome_chat_completions():
                         elif isinstance(message["content"], list):
                             for item in message["content"]:
                                 if (
-                                    isinstance(item, dict) and
-                                    item.get("type") == "text"
+                                        isinstance(item, dict) and
+                                        item.get("type") == "text"
                                 ):
                                     user_content += (
-                                        item.get("text", "") +
-                                        " "
+                                            item.get("text", "") +
+                                            " "
                                     )
                 user_content = user_content.strip()
                 user_content_replaced = user_content.replace(
                     '\n', '\\n'
                 ).replace('\r', '\\n')
-                response_content_replaced = (f"```Thinking\n{reasoning_content_accumulated}\n```\n" if reasoning_content_accumulated else "") + content_accumulated
+                response_content_replaced = (
+                                                    f"```Thinking\n{reasoning_content_accumulated}\n```\n" if reasoning_content_accumulated else "") + content_accumulated
                 response_content_replaced = response_content_replaced.replace(
                     '\n', '\\n'
                 ).replace('\r', '\\n')
@@ -930,7 +1004,8 @@ def handsome_chat_completions():
                 prompt_tokens = response_json["usage"]["prompt_tokens"]
                 completion_tokens = response_json["usage"]["completion_tokens"]
                 response_content = ""
-                if model_name.endswith("-thinking") and "choices" in response_json and len(response_json["choices"]) > 0:
+                if model_name.endswith("-thinking") and "choices" in response_json and len(
+                        response_json["choices"]) > 0:
                     choice = response_json["choices"][0]
                     if "message" in choice:
                         if "reasoning_content" in choice["message"]:
@@ -941,7 +1016,8 @@ def handsome_chat_completions():
                             response_content += formatted_reasoning + "\n"
                         if "content" in choice["message"]:
                             response_content += choice["message"]["content"]
-                elif model_name.endswith("-openwebui") and "choices" in response_json and len(response_json["choices"]) > 0:
+                elif model_name.endswith("-openwebui") and "choices" in response_json and len(
+                        response_json["choices"]) > 0:
                     choice = response_json["choices"][0]
                     if "message" in choice:
                         if "reasoning_content" in choice["message"]:
@@ -966,12 +1042,12 @@ def handsome_chat_completions():
                     elif isinstance(message["content"], list):
                         for item in message["content"]:
                             if (
-                                isinstance(item, dict) and
-                                item.get("type") == "text"
+                                    isinstance(item, dict) and
+                                    item.get("type") == "text"
                             ):
                                 user_content += (
-                                    item.get("text", "") +
-                                    " "
+                                        item.get("text", "") +
+                                        " "
                                 )
             user_content = user_content.strip()
             user_content_replaced = user_content.replace(
@@ -1122,18 +1198,18 @@ def handsome_chat_completions():
                         }
                         yield f"data: {json.dumps(error_chunk_data)}\n\n".encode('utf-8')
                         end_chunk_data = {
-                                "id": f"chatcmpl-{uuid.uuid4()}",
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": model_name,
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {},
-                                        "finish_reason": "stop"
-                                    }
-                                ]
-                            }
+                            "id": f"chatcmpl-{uuid.uuid4()}",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model_name,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {},
+                                    "finish_reason": "stop"
+                                }
+                            ]
+                        }
                         yield f"data: {json.dumps(end_chunk_data)}\n\n".encode('utf-8')
                     logging.info(
                         f"使用的key: {api_key}, "
@@ -1163,12 +1239,12 @@ def handsome_chat_completions():
                         "model": model_name,
                         "choices": [
                             {
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": markdown_image_link if image_url else "Failed to generate image",
-                            },
-                            "finish_reason": "stop",
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": markdown_image_link if image_url else "Failed to generate image",
+                                },
+                                "finish_reason": "stop",
                             }
                         ],
                     }
@@ -1184,12 +1260,12 @@ def handsome_chat_completions():
                         "model": model_name,
                         "choices": [
                             {
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": "Failed to process image data",
-                            },
-                            "finish_reason": "stop",
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "Failed to process image data",
+                                },
+                                "finish_reason": "stop",
                             }
                         ],
                     }
@@ -1230,8 +1306,8 @@ def handsome_chat_completions():
                             yield chunk
                     end_time = time.time()
                     first_token_time = (
-                        first_chunk_time - start_time
-                        if first_chunk_time else 0
+                            first_chunk_time - start_time
+                            if first_chunk_time else 0
                     )
                     total_time = end_time - start_time
                     prompt_tokens = 0
@@ -1245,34 +1321,34 @@ def handsome_chat_completions():
                             try:
                                 response_json = json.loads(line)
                                 if (
-                                    "usage" in response_json and
-                                    "completion_tokens" in response_json["usage"]
+                                        "usage" in response_json and
+                                        "completion_tokens" in response_json["usage"]
                                 ):
                                     completion_tokens = response_json[
                                         "usage"
                                     ]["completion_tokens"]
                                 if (
-                                    "choices" in response_json and
-                                    len(response_json["choices"]) > 0 and
-                                    "delta" in response_json["choices"][0] and
-                                    "content" in response_json[
-                                        "choices"
-                                    ][0]["delta"]
+                                        "choices" in response_json and
+                                        len(response_json["choices"]) > 0 and
+                                        "delta" in response_json["choices"][0] and
+                                        "content" in response_json[
+                                            "choices"
+                                        ][0]["delta"]
                                 ):
                                     response_content += response_json[
                                         "choices"
                                     ][0]["delta"]["content"]
                                 if (
-                                    "usage" in response_json and
-                                    "prompt_tokens" in response_json["usage"]
+                                        "usage" in response_json and
+                                        "prompt_tokens" in response_json["usage"]
                                 ):
                                     prompt_tokens = response_json[
                                         "usage"
                                     ]["prompt_tokens"]
                             except (
-                                KeyError,
-                                ValueError,
-                                IndexError
+                                    KeyError,
+                                    ValueError,
+                                    IndexError
                             ) as e:
                                 logging.error(
                                     f"解析流式响应单行 JSON 失败: {e}, "
@@ -1297,9 +1373,9 @@ def handsome_chat_completions():
                     )
                     with data_lock:
                         request_timestamps.append(time.time())
-                        token_counts.append(prompt_tokens+completion_tokens)
+                        token_counts.append(prompt_tokens + completion_tokens)
                         request_timestamps_day.append(time.time())
-                        token_counts_day.append(prompt_tokens+completion_tokens)
+                        token_counts_day.append(prompt_tokens + completion_tokens)
                 return Response(
                     stream_with_context(generate()),
                     content_type=response.headers['Content-Type']
@@ -1345,12 +1421,14 @@ def handsome_chat_completions():
                 with data_lock:
                     request_timestamps.append(time.time())
                     if "prompt_tokens" in response_json["usage"] and "completion_tokens" in response_json["usage"]:
-                        token_counts.append(response_json["usage"]["prompt_tokens"] + response_json["usage"]["completion_tokens"])
+                        token_counts.append(
+                            response_json["usage"]["prompt_tokens"] + response_json["usage"]["completion_tokens"])
                     else:
                         token_counts.append(0)
                     request_timestamps_day.append(time.time())
                     if "prompt_tokens" in response_json["usage"] and "completion_tokens" in response_json["usage"]:
-                        token_counts_day.append(response_json["usage"]["prompt_tokens"] + response_json["usage"]["completion_tokens"])
+                        token_counts_day.append(
+                            response_json["usage"]["prompt_tokens"] + response_json["usage"]["completion_tokens"])
                     else:
                         token_counts_day.append(0)
                 return jsonify(response_json)
@@ -1358,13 +1436,20 @@ def handsome_chat_completions():
             logging.error(f"请求转发异常: {e}")
             return jsonify({"error": str(e)}), 500
 
-if __name__ == "__main__":
-    logging.info(f"环境变量: {os.environ}")
-    load_keys()
-    logging.info("启动时加载 KEYS 完成")
-    scheduler.start()
-    logging.info("Scheduler 启动")
-    refresh_models()
-    logging.info("首次刷新模型列表执行完成")
-    port = int(os.environ.get("PORT", 7860))
-    app.run(debug=False, host="0.0.0.0", port=port)
+# 在 if __name__ == '__main__': 块外定义
+load_keys()
+logging.info("程序启动时首次加载 keys 已执行")
+scheduler.start()
+logging.info("首次加载 keys 已手动触发执行")
+refresh_models()
+logging.info("首次刷新模型列表已手动触发执行")
+
+if __name__ == '__main__':
+    # logging.info(f"环境变量：{os.environ}") # 移动到前面
+    # load_keys()
+    # logging.info("程序启动时首次加载 keys 已执行")
+    # scheduler.start()
+    # logging.info("首次加载 keys 已手动触发执行")
+    # refresh_models()
+    # logging.info("首次刷新模型列表已手动触发执行")
+    app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 7860)))
