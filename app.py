@@ -4,7 +4,7 @@ from itertools import chain
 from PIL import Image
 from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
-from flask import Flask, request, jsonify, Response, stream_with_context, render_template # Import render_template
+from flask import Flask, request, jsonify, Response, stream_with_context, render_template # Import render_template and datetime
 from werkzeug.middleware.proxy_fix import ProxyFix
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
@@ -443,8 +443,21 @@ def index():
                 logging.error(f"获取 KEY {obfuscate_key(key)} 余额信息失败: {exc}")
                 key_balances.append({"key": obfuscate_key(key), "balance": "获取失败"})
 
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") # Get current time for display
+    return render_template('index.html', rpm=rpm, tpm=tpm, rpd=rpd, tpd=tpd, key_balances=key_balances, now=now) # Render template instead of jsonify
 
-    return render_template('index.html', rpm=rpm, tpm=tpm, rpd=rpd, tpd=tpd, key_balances=key_balances) # Render template instead of jsonify
+@app.route('/env_test') # 添加一个新的路由用于测试环境变量
+def env_test():
+    api_key_from_env = os.environ.get('KEYS', '环境变量 KEYS 未设置') # 读取 KEYS 环境变量，并设置默认值
+    authorization_key_from_env = os.environ.get('AUTHORIZATION_KEY', '环境变量 AUTHORIZATION_KEY 未设置') # 读取 AUTHORIZATION_KEY，设置默认值
+    port_from_env = os.environ.get('PORT', '环境变量 PORT 未设置') # 读取 PORT，设置默认值
+
+    return jsonify({ # 返回 JSON 格式的环境变量信息
+        "KEYS": api_key_from_env,
+        "AUTHORIZATION_KEY": auth_key_from_env,
+        "PORT": port_from_env
+    })
+
 
 @app.route('/handsome/v1/models', methods=['GET'])
 def list_models():
@@ -1393,4 +1406,3 @@ if __name__ == '__main__':
     refresh_models()
     logging.info("首次刷新模型列表已手动触发执行")
     app.run(debug=False,host='0.0.0.0',port=int(os.environ.get('PORT', 7860)))
-    
