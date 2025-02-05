@@ -397,7 +397,7 @@ def key_is_valid(key, request_type):
     total_balance = credit_summary.get("total_balance", 0)
     if request_type == "free":
         return True
-    elif request_type == "paid" or request_type == "unverified":  # Fixed typo here
+    elif request_type == "paid" or request_type == "unverified":
         return total_balance > 0
     else:
         return False
@@ -481,7 +481,7 @@ def env_test():
         "PORT": port_from_env
     })
 
-@app.route('/handsome/v1/models', methods=['GET'])
+@app.route('/v1/models', methods=['GET'])
 def list_models():
     if not check_authorization(request):
         return jsonify({"error": "Unauthorized"}), 401
@@ -526,7 +526,7 @@ def list_models():
         "data": detailed_models
     })
 
-@app.route('/handsome/v1/dashboard/billing/usage', methods=['GET'])
+@app.route('/v1/dashboard/billing/usage', methods=['GET'])
 def billing_usage():
     if not check_authorization(request):
         return jsonify({"error": "Unauthorized"}), 401
@@ -537,7 +537,7 @@ def billing_usage():
         "total_usage": 0
     })
 
-@app.route('/handsome/v1/dashboard/billing/subscription', methods=['GET'])
+@app.route('/v1/dashboard/billing/subscription', methods=['GET'])
 def billing_subscription():
     if not check_authorization(request):
         return jsonify({"error": "Unauthorized"}), 401
@@ -567,7 +567,7 @@ def billing_subscription():
         "system_hard_limit_usd": total_balance
     })
 
-@app.route('/handsome/v1/embeddings', methods=['POST'])
+@app.route('/v1/embeddings', methods=['POST'])
 def handsome_embeddings():
     if not check_authorization(request):
         return jsonify({"error": "Unauthorized"}), 401
@@ -637,7 +637,7 @@ def handsome_embeddings():
     except requests.exceptions.RequestException as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/handsome/v1/images/generations', methods=['POST'])
+@app.route('/v1/images/generations', methods=['POST'])
 def handsome_images_generations():
     if not check_authorization(request):
         return jsonify({"error": "Unauthorized"}), 401
@@ -733,7 +733,7 @@ def handsome_images_generations():
     else:
         return jsonify({"error": "Unsupported model"}), 400
 
-@app.route('/handsome/v1/chat/completions', methods=['POST'])
+@app.route('/v1/chat/completions', methods=['POST'])
 def handsome_chat_completions():
     if not check_authorization(request):
         return jsonify({"error": "Unauthorized"}), 401
@@ -1452,4 +1452,5 @@ if __name__ == '__main__':
     # logging.info("首次加载 keys 已手动触发执行")
     # refresh_models()
     # logging.info("首次刷新模型列表已手动触发执行")
-    app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 7860)))
+    # 注释掉 app.run()
+    # app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 7860))) 
