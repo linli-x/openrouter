@@ -1,45 +1,49 @@
-import os,time,logging,requests,json,uuid,concurrent.futures,threading,base64,io
+import os
+import time
+import logging
+import requests
+import json
+import uuid
+import concurrent.futures
+import threading
+import base64
+import io
 from io import BytesIO
 from itertools import chain
 from PIL import Image
-from datetime import datetime
+import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
-from flask import Flask, request, jsonify, Response, stream_with_context, render_template # Import render_template and datetime
+from flask import Flask, request, jsonify, Response, stream_with_context, render_template
 from werkzeug.middleware.proxy_fix import ProxyFix
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
+
+# 设置时区及日志
 os.environ['TZ'] = 'Asia/Shanghai'
 time.tzset()
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# API 端点
 API_ENDPOINT = "https://api-st.siliconflow.cn/v1/user/info"
 TEST_MODEL_ENDPOINT = "https://api-st.siliconflow.cn/v1/chat/completions"
 MODELS_ENDPOINT = "https://api-st.siliconflow.cn/v1/models"
 EMBEDDINGS_ENDPOINT = "https://api-st.siliconflow.cn/v1/embeddings"
 IMAGE_ENDPOINT = "https://api-st.siliconflow.cn/v1/images/generations"
-def requests_session_with_retries(
-    retries=3, backoff_factor=0.3, status_forcelist=(500, 502, 504)
-):
+
+def requests_session_with_retries(retries=3, backoff_factor=0.3, status_forcelist=(500, 502, 504)):
     session = requests.Session()
-    retry = Retry(
-        total=retries,
-        read=retries,
-        connect=retries,
-        backoff_factor=backoff_factor,
-        status_forcelist=status_forcelist,
-    )
-    adapter = HTTPAdapter(
-        max_retries=retry,
-        pool_connections=1000,
-        pool_maxsize=10000,
-        pool_block=False
-    )
+    retry = Retry(total=retries, read=retries, connect=retries, backoff_factor=backoff_factor, status_forcelist=status_forcelist)
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=1000, pool_maxsize=10000, pool_block=False)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
+
 session = requests_session_with_retries()
+
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
+
+# 定义全局数据结构
 models = {
     "text": [],
     "free_text": [],
@@ -56,16 +60,15 @@ key_status = {
 }
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=10000)
 model_key_indices = {}
-request_timestamps = []
-token_counts = []
-request_timestamps_day = []
-token_counts_day = []
+request_timestamps = []  # 每分钟请求时间戳
+token_counts = []        # 每分钟 token 数
+request_timestamps_day = []  # 每日请求时间戳
+token_counts_day = []        # 每日 token 数
 data_lock = threading.Lock()
+
+# 获取某个 API KEY 的额度
 def get_credit_summary(api_key):
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -76,15 +79,14 @@ def get_credit_summary(api_key):
             logging.info(f"获取额度，API Key：{api_key}，当前额度: {total_balance}")
             return {"total_balance": float(total_balance)}
         except requests.exceptions.Timeout as e:
-            logging.error(f"获取额度信息失败，API Key：{api_key}，尝试次数：{attempt+1}/{max_retries}，错误信息：{e} (Timeout)")
+            logging.error(f"获取额度信息失败，API Key：{api_key}，第 {attempt+1}/{max_retries} 次错误：{e} (Timeout)")
             if attempt >= max_retries - 1:
-                logging.error(f"获取额度信息失败，API Key：{api_key}，所有重试次数均已失败 (Timeout)")
+                logging.error(f"API Key：{api_key} 重试所有次数均失败 (Timeout)")
         except requests.exceptions.RequestException as e:
-            logging.error(f"获取额度信息失败，API Key：{api_key}，错误信息：{e}")
+            logging.error(f"获取额度失败，API Key：{api_key}，错误：{e}")
             return None
-FREE_MODEL_TEST_KEY = (
-    "sk-bmjbjzleaqfgtqfzmcnsbagxrlohriadnxqrzfocbizaxukw"
-)
+
+FREE_MODEL_TEST_KEY = "sk-bmjbjzleaqfgtqfzmcnsbagxrlohriadnxqrzfocbizaxukw"
 FREE_IMAGE_LIST = [
     "stabilityai/stable-diffusion-3-5-large",
     "black-forest-labs/FLUX.1-schnell",
@@ -92,34 +94,25 @@ FREE_IMAGE_LIST = [
     "stabilityai/stable-diffusion-xl-base-1.0",
     "stabilityai/stable-diffusion-2-1"
 ]
+
 def test_model_availability(api_key, model_name, model_type="chat"):
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     if model_type == "image":
         return model_name in FREE_IMAGE_LIST
     try:
         endpoint = EMBEDDINGS_ENDPOINT if model_type == "embedding" else TEST_MODEL_ENDPOINT
-        payload = (
-            {"model": model_name, "input": ["hi"]}
-            if model_type == "embedding"
-            else {"model": model_name, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5, "stream": False}
-        )
-        timeout = 10 if model_type == "embedding" else 5
-        response = session.post(
-            endpoint,
-            headers=headers,
-            json=payload,
-            timeout=timeout
-        )
+        if model_type == "embedding":
+            payload = {"model": model_name, "input": ["hi"]}
+            timeout = 10
+        else:
+            payload = {"model": model_name, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5, "stream": False}
+            timeout = 5
+        response = session.post(endpoint, headers=headers, json=payload, timeout=timeout)
         return response.status_code in [200, 429]
     except requests.exceptions.RequestException as e:
-        logging.error(
-            f"测试{model_type}模型 {model_name} 可用性失败，"
-            f"API Key：{api_key}，错误信息：{e}"
-        )
+        logging.error(f"测试 {model_type} 模型 {model_name} 可用性失败，API Key：{api_key}，错误：{e}")
         return False
+
 def process_image_url(image_url, response_format=None):
     if not image_url:
         return {"url": ""}
@@ -136,6 +129,7 @@ def process_image_url(image_url, response_format=None):
             logging.error(f"图片转base64失败: {e}")
             return {"url": image_url}
     return {"url": image_url}
+
 def create_base64_markdown_image(image_url):
     try:
         response = session.get(image_url, stream=True)
@@ -147,31 +141,30 @@ def create_base64_markdown_image(image_url):
         resized_image.save(buffered, format="PNG")
         base64_encoded = base64.b64encode(buffered.getvalue()).decode('utf-8')
         markdown_image_link = f"![](data:image/png;base64,{base64_encoded})"
-        logging.info("Created base64 markdown image link.")
+        logging.info("成功生成 Markdown 格式 Base64 图片。")
         return markdown_image_link
     except Exception as e:
-        logging.error(f"Error creating markdown image: {e}")
+        logging.error(f"生成 Markdown 图片失败: {e}")
         return None
+
 def extract_user_content(messages):
     user_content = ""
     for message in messages:
-        if message["role"] == "user":
-            if isinstance(message["content"], str):
+        if message.get("role") == "user":
+            if isinstance(message.get("content"), str):
                 user_content += message["content"] + " "
-            elif isinstance(message["content"], list):
+            elif isinstance(message.get("content"), list):
                 for item in message["content"]:
                     if isinstance(item, dict) and item.get("type") == "text":
                         user_content += item.get("text", "") + " "
     return user_content.strip()
+
 def get_siliconflow_data(model_name, data):
-    siliconflow_data = {
-        "model": model_name,
-        "prompt": data.get("prompt") or "",
-    }
+    siliconflow_data = {"model": model_name, "prompt": data.get("prompt") or ""}
     if model_name == "black-forest-labs/FLUX.1-pro":
         siliconflow_data.update({
-            "width": max(256, min(1440, (data.get("width", 1024) // 32) * 32)),
-            "height": max(256, min(1440, (data.get("height", 768) // 32) * 32)),
+            "width": max(256, min(1440, (data.get("width", 1024)//32)*32)),
+            "height": max(256, min(1440, (data.get("height", 768)//32)*32)),
             "prompt_upsampling": data.get("prompt_upsampling", False),
             "image_prompt": data.get("image_prompt"),
             "steps": max(1, min(50, data.get("steps", 20))),
@@ -202,6 +195,7 @@ def get_siliconflow_data(model_name, data):
     if "image_size" in siliconflow_data and siliconflow_data["image_size"] not in valid_sizes:
         siliconflow_data["image_size"] = "1024x1024"
     return siliconflow_data
+
 def refresh_models():
     global models
     models["text"] = get_all_models(FREE_MODEL_TEST_KEY, "chat")
@@ -219,24 +213,16 @@ def refresh_models():
                 logging.warning("环境变量 BAN_MODELS 格式不正确，应为 JSON 数组。")
                 ban_models = []
         except json.JSONDecodeError:
-            logging.warning("环境变量 BAN_MODELS JSON 解析失败，请检查格式。")
+            logging.warning("解析环境变量 BAN_MODELS 失败。")
     models["text"] = [model for model in models["text"] if model not in ban_models]
     models["embedding"] = [model for model in models["embedding"] if model not in ban_models]
     models["image"] = [model for model in models["image"] if model not in ban_models]
-    model_types = [
-        ("text", "chat"),
-        ("embedding", "embedding"),
-        ("image", "image")
-    ]
+    model_types = [("text", "chat"), ("embedding", "embedding"), ("image", "image")]
     for model_type, test_type in model_types:
         with concurrent.futures.ThreadPoolExecutor(max_workers=10000) as executor:
             future_to_model = {
-                executor.submit(
-                    test_model_availability,
-                    FREE_MODEL_TEST_KEY,
-                    model,
-                    test_type
-                ): model for model in models[model_type]
+                executor.submit(test_model_availability, FREE_MODEL_TEST_KEY, model, test_type): model
+                for model in models[model_type]
             }
             for future in concurrent.futures.as_completed(future_to_model):
                 model = future_to_model[future]
@@ -245,10 +231,11 @@ def refresh_models():
                     if is_free:
                         models[f"free_{model_type}"].append(model)
                 except Exception as exc:
-                    logging.error(f"{model_type}模型 {model} 测试生成异常: {exc}")
+                    logging.error(f"{model_type} 模型 {model} 测试失败: {exc}")
     for model_type in ["text", "embedding", "image"]:
-        logging.info(f"所有{model_type}模型列表：{models[model_type]}")
-        logging.info(f"免费{model_type}模型列表：{models[f'free_{model_type}']}")
+        logging.info(f"所有 {model_type} 模型：{models[model_type]}")
+        logging.info(f"免费 {model_type} 模型：{models[f'free_{model_type}']}")
+
 def load_keys():
     global key_status
     for status in key_status:
@@ -260,7 +247,7 @@ def load_keys():
     test_model = os.environ.get("TEST_MODEL", "Pro/google/gemma-2-9b-it")
     unique_keys = list(set(key.strip() for key in keys_str.split(',')))
     os.environ["KEYS"] = ','.join(unique_keys)
-    logging.info(f"加载的 keys：{unique_keys}")
+    logging.info(f"加载的 KEYS: {unique_keys}")
     def process_key_with_logging(key):
         try:
             key_type = process_key(key, test_model)
@@ -268,7 +255,7 @@ def load_keys():
                 key_status[key_type].append(key)
             return key_type
         except Exception as exc:
-            logging.error(f"处理 KEY {key} 生成异常: {exc}")
+            logging.error(f"处理 KEY {key} 异常: {exc}")
             return "invalid"
     with concurrent.futures.ThreadPoolExecutor(max_workers=10000) as executor:
         futures = [executor.submit(process_key_with_logging, key) for key in unique_keys]
@@ -280,6 +267,7 @@ def load_keys():
     free_keys_global = key_status["free"]
     unverified_keys_global = key_status["unverified"]
     valid_keys_global = key_status["valid"]
+
 def process_key(key, test_model):
     credit_summary = get_credit_summary(key)
     if credit_summary is None:
@@ -293,43 +281,25 @@ def process_key(key, test_model):
                 return "valid"
             else:
                 return "unverified"
+
 def get_all_models(api_key, sub_type):
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     try:
-        response = session.get(
-            MODELS_ENDPOINT,
-            headers=headers,
-            params={"sub_type": sub_type}
-        )
+        response = session.get(MODELS_ENDPOINT, headers=headers, params={"sub_type": sub_type})
         response.raise_for_status()
         data = response.json()
-        if (
-            isinstance(data, dict) and
-            'data' in data and
-            isinstance(data['data'], list)
-        ):
-            return [
-                model.get("id") for model in data["data"]
-                if isinstance(model, dict) and "id" in model
-            ]
+        if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+            return [model.get("id") for model in data["data"] if isinstance(model, dict) and "id" in model]
         else:
-            logging.error("获取模型列表失败：响应数据格式不正确")
+            logging.error("获取模型列表失败：响应格式错误")
             return []
     except requests.exceptions.RequestException as e:
-        logging.error(
-            f"获取模型列表失败，"
-            f"API Key：{api_key}，错误信息：{e}"
-        )
+        logging.error(f"获取模型列表失败，API Key：{api_key}，错误：{e}")
         return []
     except (KeyError, TypeError) as e:
-        logging.error(
-            f"解析模型列表失败，"
-            f"API Key：{api_key}，错误信息：{e}"
-        )
+        logging.error(f"解析模型列表失败，API Key：{api_key}，错误：{e}")
         return []
+
 def determine_request_type(model_name, model_list, free_model_list):
     if model_name in free_model_list:
         return "free"
@@ -337,36 +307,28 @@ def determine_request_type(model_name, model_list, free_model_list):
         return "paid"
     else:
         return "unknown"
+
 def select_key(request_type, model_name):
     if request_type == "free":
-        available_keys = (
-            free_keys_global +
-            unverified_keys_global +
-            valid_keys_global
-        )
+        available_keys = free_keys_global + unverified_keys_global + valid_keys_global
     elif request_type == "paid":
         available_keys = unverified_keys_global + valid_keys_global
     else:
-        available_keys = (
-            free_keys_global +
-            unverified_keys_global +
-            valid_keys_global
-        )
+        available_keys = free_keys_global + unverified_keys_global + valid_keys_global
     if not available_keys:
         return None
     current_index = model_key_indices.get(model_name, 0)
-    for _ in range(len(available_keys)): # Corrected line: _in changed to _
+    for _ in range(len(available_keys)):
         key = available_keys[current_index % len(available_keys)]
         current_index += 1
         if key_is_valid(key, request_type):
             model_key_indices[model_name] = current_index
             return key
         else:
-            logging.warning(
-                f"KEY {key} 无效或达到限制，尝试下一个 KEY"
-            )
+            logging.warning(f"KEY {key} 无效或达到限制，尝试下一个")
     model_key_indices[model_name] = 0
     return None
+
 def key_is_valid(key, request_type):
     if request_type == "invalid":
         return False
@@ -376,18 +338,19 @@ def key_is_valid(key, request_type):
     total_balance = credit_summary.get("total_balance", 0)
     if request_type == "free":
         return True
-    elif request_type == "paid" or request_type == "unverified": #Fixed typo here
+    elif request_type in ["paid", "unverified"]:
         return total_balance > 0
     else:
         return False
+
 def check_authorization(request):
     authorization_key = os.environ.get("AUTHORIZATION_KEY")
     if not authorization_key:
-        logging.warning("环境变量 AUTHORIZATION_KEY 未设置，此时无需鉴权即可使用，建议进行设置后再使用。")
+        logging.warning("环境变量 AUTHORIZATION_KEY 未设置，暂不鉴权")
         return True
-    auth_header = request.headers.get('Authorization')
+    auth_header = request.headers.get("Authorization")
     if not auth_header:
-        logging.warning("请求头中缺少 Authorization 字段。")
+        logging.warning("请求头缺少 Authorization 字段")
         return False
     if auth_header != f"Bearer {authorization_key}":
         logging.warning(f"无效的 Authorization 密钥：{auth_header}")
@@ -400,18 +363,18 @@ def obfuscate_key(key):
     prefix_length = 6
     suffix_length = 4
     if len(key) <= prefix_length + suffix_length:
-        return "****" # If key is too short, just mask it all
+        return "****"
     prefix = key[:prefix_length]
     suffix = key[-suffix_length:]
     masked_part = "*" * (len(key) - prefix_length - suffix_length)
     return prefix + masked_part + suffix
 
 scheduler = BackgroundScheduler()
-scheduler.add_job(load_keys, 'interval', hours=1)
+scheduler.add_job(load_keys, "interval", hours=1)
 scheduler.remove_all_jobs()
-scheduler.add_job(refresh_models, 'interval', hours=1)
+scheduler.add_job(refresh_models, "interval", hours=1)
 
-@app.route('/')
+@app.route("/")
 def index():
     current_time = time.time()
     one_minute_ago = current_time - 60
@@ -428,9 +391,8 @@ def index():
             token_counts_day.pop(0)
         rpd = len(request_timestamps_day)
         tpd = sum(token_counts_day)
-
     key_balances = []
-    all_keys = list(chain(*key_status.values())) # Get all keys from all statuses
+    all_keys = list(chain(*key_status.values()))
     with concurrent.futures.ThreadPoolExecutor(max_workers=10000) as executor:
         future_to_key = {executor.submit(get_credit_summary, key): key for key in all_keys}
         for future in concurrent.futures.as_completed(future_to_key):
@@ -440,24 +402,22 @@ def index():
                 balance = credit_summary.get("total_balance") if credit_summary else "获取失败"
                 key_balances.append({"key": obfuscate_key(key), "balance": balance})
             except Exception as exc:
-                logging.error(f"获取 KEY {obfuscate_key(key)} 余额信息失败: {exc}")
+                logging.error(f"获取 KEY {obfuscate_key(key)} 异常: {exc}")
                 key_balances.append({"key": obfuscate_key(key), "balance": "获取失败"})
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return render_template("index.html", rpm=rpm, tpm=tpm, rpd=rpd, tpd=tpd, key_balances=key_balances, now=now)
 
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") # Get current time for display
-    return render_template('index.html', rpm=rpm, tpm=tpm, rpd=rpd, tpd=tpd, key_balances=key_balances, now=now) # Render template instead of jsonify
-
-@app.route('/env_test') # 添加一个新的路由用于测试环境变量
+# 用于测试环境变量是否正确加载
+@app.route("/env_test")
 def env_test():
-    api_key_from_env = os.environ.get('KEYS', '环境变量 KEYS 未设置') # 读取 KEYS 环境变量，并设置默认值
-    authorization_key_from_env = os.environ.get('AUTHORIZATION_KEY', '环境变量 AUTHORIZATION_KEY 未设置') # 读取 AUTHORIZATION_KEY，设置默认值
-    port_from_env = os.environ.get('PORT', '环境变量 PORT 未设置') # 读取 PORT，设置默认值
-
-    return jsonify({ # 返回 JSON 格式的环境变量信息
+    api_key_from_env = os.environ.get("KEYS", "环境变量 KEYS 未设置")
+    authorization_key_from_env = os.environ.get("AUTHORIZATION_KEY", "环境变量 AUTHORIZATION_KEY 未设置")
+    port_from_env = os.environ.get("PORT", "环境变量 PORT 未设置")
+    return jsonify({
         "KEYS": api_key_from_env,
-        "AUTHORIZATION_KEY": auth_key_from_env,
+        "AUTHORIZATION_KEY": authorization_key_from_env,
         "PORT": port_from_env
     })
-
 
 @app.route('/handsome/v1/models', methods=['GET'])
 def list_models():
@@ -1397,12 +1357,14 @@ def handsome_chat_completions():
         except requests.exceptions.RequestException as e:
             logging.error(f"请求转发异常: {e}")
             return jsonify({"error": str(e)}), 500
-if __name__ == '__main__':
-    logging.info(f"环境变量：{os.environ}")
+
+if __name__ == "__main__":
+    logging.info(f"环境变量: {os.environ}")
     load_keys()
-    logging.info("程序启动时首次加载 keys 已执行")
+    logging.info("启动时加载 KEYS 完成")
     scheduler.start()
-    logging.info("首次加载 keys 已手动触发执行")
+    logging.info("Scheduler 启动")
     refresh_models()
-    logging.info("首次刷新模型列表已手动触发执行")
-    app.run(debug=False,host='0.0.0.0',port=int(os.environ.get('PORT', 7860)))
+    logging.info("首次刷新模型列表执行完成")
+    port = int(os.environ.get("PORT", 7860))
+    app.run(debug=False, host="0.0.0.0", port=port)
