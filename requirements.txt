@@ -1,5 +1,6 @@
 Flask
 requests
-Pillow
 apscheduler
-Werkzeug
+Image
+flask-cors
+psutil

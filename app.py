@@ -1,30 +1,125 @@
-import os, time, logging, requests, json, uuid, concurrent.futures, threading, base64, io
+import os,time,logging,requests,json,uuid,concurrent.futures,threading,base64,io
 from io import BytesIO
 from itertools import chain
 from PIL import Image
 from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
-from flask import Flask, request, jsonify, Response, stream_with_context, render_template
+from flask import Flask, request, jsonify, Response, stream_with_context, render_template # Import render_template
 from werkzeug.middleware.proxy_fix import ProxyFix
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
-
-# 设置时区
+from flask_cors import CORS
+import platform
+import psutil
 os.environ['TZ'] = 'Asia/Shanghai'
 time.tzset()
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 
-# 配置日志记录
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# 记录服务启动时间
+SERVICE_START_TIME = datetime.now()
 
-# API 端点
-API_ENDPOINT = "https://api-st.siliconflow.cn/v1/user/info"
-TEST_MODEL_ENDPOINT = "https://api-st.siliconflow.cn/v1/chat/completions"
-MODELS_ENDPOINT = "https://api-st.siliconflow.cn/v1/models"
-EMBEDDINGS_ENDPOINT = "https://api-st.siliconflow.cn/v1/embeddings"
-IMAGE_ENDPOINT = "https://api-st.siliconflow.cn/v1/images/generations"
+# 创建自定义日志过滤器，排除 /ping 端点的日志
+class PingFilter(logging.Filter):
+    def filter(self, record):
+        # 首先检查是否在请求上下文内，避免"Working outside of request context"错误
+        try:
+            from flask import request as _request
+            request_exists = _request._get_current_object() is not None
+        except (RuntimeError, ImportError):
+            # 如果不在请求上下文中，允许日志通过
+            return True
+            
+        # 仅在请求上下文中检查路径
+        if request_exists and hasattr(_request, 'path') and (_request.path == '/ping' or _request.path.endswith('/ping')):
+            return False  # 不记录 /ping 请求的日志
+        return True  # 记录其他所有请求的日志
 
-# 设置请求会话，包括重试机制
-def requests_session_with_retries(retries=3, backoff_factor=0.3, status_forcelist=(500, 502, 504)):
+# 添加API前缀配置
+API_PREFIX = os.environ.get('API_PREFIX', '')  # 默认为空字符串
+API_ENDPOINT = "https://openrouter.ai/api/v1/auth/key"
+TEST_MODEL_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+MODELS_ENDPOINT = "https://openrouter.ai/api/v1/models"
+
+# 添加模型提供商路由配置
+MODEL_PROVIDER_ROUTING = {}  # 存储模型->提供商的路由配置
+
+# 从环境变量加载模型提供商路由配置
+def load_model_provider_routing():
+    """从环境变量加载模型提供商路由配置"""
+    global MODEL_PROVIDER_ROUTING
+    
+    # 设置默认路由配置
+    default_routing = {}
+    
+    # 首先应用默认配置
+    MODEL_PROVIDER_ROUTING = default_routing.copy()
+    
+    # 然后从环境变量加载自定义配置
+    routing_config = os.environ.get('MODEL_PROVIDER_ROUTING', '')
+    if (routing_config):
+        try:
+            routing_data = json.loads(routing_config)
+            if isinstance(routing_data, dict):
+                # 将环境变量中的配置合并到默认配置中（会覆盖相同的键）
+                MODEL_PROVIDER_ROUTING.update(routing_data)
+                logging.info(f"已从环境变量加载模型提供商路由配置")
+            else:
+                logging.warning("MODEL_PROVIDER_ROUTING 环境变量必须是有效的JSON对象")
+        except json.JSONDecodeError:
+            logging.warning("MODEL_PROVIDER_ROUTING 环境变量包含无效的JSON数据")
+    
+    # 记录最终的路由配置
+    if MODEL_PROVIDER_ROUTING:
+        formatted_config = json.dumps(MODEL_PROVIDER_ROUTING, ensure_ascii=False, indent=2)
+        logging.info(f"最终模型路由配置:\n{formatted_config}")
+    else:
+        logging.info("未配置任何模型路由")
+    
+    return MODEL_PROVIDER_ROUTING
+
+# 获取指定模型的提供商路由配置
+def get_model_provider_routing(model_name):
+    """获取指定模型的提供商路由配置"""
+    if model_name in MODEL_PROVIDER_ROUTING:
+        return MODEL_PROVIDER_ROUTING[model_name]
+    # 尝试获取模型前缀的配置（例如"gpt-3.5"可能匹配"gpt-3.5-turbo"）
+    for prefix, providers in MODEL_PROVIDER_ROUTING.items():
+        if model_name.startswith(prefix):
+            return providers
+    return None
+
+# 添加免费请求统计
+FREE_REQUESTS_LIMIT = 200  # 每日免费请求限制
+free_requests_count = {}  # 用于存储每个API密钥的免费请求计数
+last_reset_date = None  # 用于跟踪上次重置计数的日期
+
+def reset_free_requests_if_needed():
+    """每天重置免费请求计数"""
+    global last_reset_date, free_requests_count
+    current_date = datetime.now().date()
+    
+    if last_reset_date != current_date:
+        free_requests_count = {}  # 重置所有计数
+        last_reset_date = current_date
+        logging.info("已重置所有API密钥的免费请求计数")
+
+def increment_free_requests(api_key):
+    """增加API密钥的免费请求计数"""
+    reset_free_requests_if_needed()
+    if api_key not in free_requests_count:
+        free_requests_count[api_key] = 0
+    free_requests_count[api_key] += 1
+    return free_requests_count[api_key]
+
+def get_free_requests_count(api_key):
+    """获取API密钥的免费请求计数"""
+    reset_free_requests_if_needed()
+    return free_requests_count.get(api_key, 0)
+
+def requests_session_with_retries(
+    retries=3, backoff_factor=0.3, status_forcelist=(500, 502, 504)
+):
     session = requests.Session()
     retry = Retry(
         total=retries,
@@ -42,21 +137,19 @@ def requests_session_with_retries(retries=3, backoff_factor=0.3, status_forcelis
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
-
 session = requests_session_with_retries()
-
-# 初始化 Flask 应用
 app = Flask(__name__)
+CORS(app)  # 启用CORS支持
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
 
-# 模型和密钥状态的全局变量
+# 将自定义日志过滤器应用到 Flask 的日志记录器
+app.logger.addFilter(PingFilter())
+# 也将过滤器应用到 Werkzeug 的日志记录器
+logging.getLogger('werkzeug').addFilter(PingFilter())
+
 models = {
     "text": [],
-    "free_text": [],
-    "embedding": [],
-    "free_embedding": [],
-    "image": [],
-    "free_image": []
+    "free_text": []
 }
 key_status = {
     "invalid": [],
@@ -64,23 +157,13 @@ key_status = {
     "unverified": [],
     "valid": []
 }
-
-# 用于并发执行任务的线程池
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=10000)
-
-# 模型密钥索引，用于轮询选择密钥
 model_key_indices = {}
-
-# 请求时间戳和令牌计数，用于简单的速率监控
 request_timestamps = []
 token_counts = []
 request_timestamps_day = []
 token_counts_day = []
-
-# 数据锁，用于保护共享数据结构的并发访问
 data_lock = threading.Lock()
-
-# 获取信用摘要的函数
 def get_credit_summary(api_key):
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -89,71 +172,86 @@ def get_credit_summary(api_key):
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            response = session.get(API_ENDPOINT, headers=headers, timeout=2)  # 设置了 2 秒超时
+            response = session.get(API_ENDPOINT, headers=headers, timeout=5)
             response.raise_for_status()
             data = response.json().get("data", {})
-            total_balance = data.get("totalBalance", 0)
-            logging.info(f"获取额度，API Key：{api_key}，当前额度: {total_balance}")
-            return {"total_balance": float(total_balance)}
+            
+            # 解析OpenRouter返回的数据
+            usage = data.get("usage", 0)
+            limit = data.get("limit")
+            limit_remaining = data.get("limit_remaining")
+            is_free_tier = data.get("is_free_tier", False)
+            rate_limit = data.get("rate_limit", {})
+            
+            # 修改余额计算逻辑
+            if limit_remaining is not None:
+                total_balance = limit_remaining
+            elif limit is not None:
+                total_balance = limit - usage
+            else:
+                # 如果是免费用户且没有limit信息，设置余额为0
+                total_balance = 0 if is_free_tier else float('inf')
+            
+            logging.info(f"获取额度，API Key：{api_key}，当前额度: {total_balance}, "
+                        f"使用量: {usage}, 限额: {limit}, 剩余限额: {limit_remaining}, "
+                        f"是否免费用户: {is_free_tier}, "
+                        f"速率限制: {rate_limit}")
+            
+            return {
+                "total_balance": float(total_balance),
+                "usage": usage,
+                "limit": limit,
+                "limit_remaining": limit_remaining,
+                "is_free_tier": is_free_tier,
+                "rate_limit": rate_limit
+            }
         except requests.exceptions.Timeout as e:
-            logging.error(
-                f"获取额度信息失败，API Key：{api_key}，尝试次数：{attempt + 1}/{max_retries}，错误信息：{e} (Timeout)")
+            logging.error(f"获取额度信息超时，API Key：{api_key}，尝试次数：{attempt+1}/{max_retries}，错误信息：{e}")
             if attempt >= max_retries - 1:
-                logging.error(f"获取额度信息失败，API Key：{api_key}，所有重试次数均已失败 (Timeout)")
+                logging.error(f"获取额度信息失败，API Key：{api_key}，所有重试次数均已失败")
+                return None
         except requests.exceptions.RequestException as e:
             logging.error(f"获取额度信息失败，API Key：{api_key}，错误信息：{e}")
+            if hasattr(e, 'response') and e.response is not None and e.response.status_code == 402:
+                logging.warning(f"API Key {api_key} 额度不足")
             return None
-
-# 用于模型可用性测试的免费模型测试密钥和免费图像列表
+        except (KeyError, ValueError, TypeError) as e:
+            logging.error(f"解析额度信息失败，API Key：{api_key}，错误信息：{e}")
+            return None
 FREE_MODEL_TEST_KEY = (
-    "sk-bmjbjzleaqfgtqfzmcnsbagxrlohriadnxqrzfocbizaxukw"  # 你需要替换为有效的测试密钥
+    "sk-bmjbjzleaqfgtqfzmcnsbagxrlohriadnxqrzfocbizaxukw"
 )
-FREE_IMAGE_LIST = [
-    "stabilityai/stable-diffusion-3-5-large",
-    "black-forest-labs/FLUX.1-schnell",
-    "stabilityai/stable-diffusion-3-medium",
-    "stabilityai/stable-diffusion-xl-base-1.0",
-    "stabilityai/stable-diffusion-2-1"
-]
-
-# 测试模型可用性的函数
 def test_model_availability(api_key, model_name, model_type="chat"):
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
-    if model_type == "image":
-        return model_name in FREE_IMAGE_LIST
     try:
-        endpoint = EMBEDDINGS_ENDPOINT if model_type == "embedding" else TEST_MODEL_ENDPOINT
-        payload = (
-            {"model": model_name, "input": ["hi"]}
-            if model_type == "embedding"
-            else {"model": model_name, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5,
-                  "stream": False}
-        )
-        timeout = 5 if model_type == "embedding" else 2  # 减少了超时时间
+        payload = {
+            "model": model_name, 
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 5,
+            "stream": False
+        }
         response = session.post(
-            endpoint,
+            TEST_MODEL_ENDPOINT,
             headers=headers,
             json=payload,
-            timeout=timeout
+            timeout=5
         )
-        return response.status_code in [200, 429]
+        return response.status_code in [200, 429, 402]
     except requests.exceptions.RequestException as e:
         logging.error(
-            f"测试{model_type}模型 {model_name} 可用性失败，"
+            f"测试模型 {model_name} 可用性失败，"
             f"API Key：{api_key}，错误信息：{e}"
         )
         return False
-
-# 处理图像 URL 的函数
 def process_image_url(image_url, response_format=None):
     if not image_url:
         return {"url": ""}
     if response_format == "b64_json":
         try:
-            response = session.get(image_url, stream=True, timeout=2)  # 设置了 2 秒超时
+            response = session.get(image_url, stream=True)
             response.raise_for_status()
             image = Image.open(response.raw)
             buffered = io.BytesIO()
@@ -164,11 +262,9 @@ def process_image_url(image_url, response_format=None):
             logging.error(f"图片转base64失败: {e}")
             return {"url": image_url}
     return {"url": image_url}
-
-# 创建 base64 编码的 Markdown 图像链接的函数
 def create_base64_markdown_image(image_url):
     try:
-        response = session.get(image_url, stream=True, timeout=2)  # 设置了 2 秒超时
+        response = session.get(image_url, stream=True)
         response.raise_for_status()
         image = Image.open(BytesIO(response.content))
         new_size = tuple(dim // 4 for dim in image.size)
@@ -182,8 +278,6 @@ def create_base64_markdown_image(image_url):
     except Exception as e:
         logging.error(f"Error creating markdown image: {e}")
         return None
-
-# 提取用户消息内容的函数
 def extract_user_content(messages):
     user_content = ""
     for message in messages:
@@ -195,8 +289,6 @@ def extract_user_content(messages):
                     if isinstance(item, dict) and item.get("type") == "text":
                         user_content += item.get("text", "") + " "
     return user_content.strip()
-
-# 获取 SiliconFlow 数据的函数
 def get_siliconflow_data(model_name, data):
     siliconflow_data = {
         "model": model_name,
@@ -232,35 +324,15 @@ def get_siliconflow_data(model_name, data):
                 "guidance_scale": max(0, min(100, data.get("guidance_scale", 7.5))),
                 "negative_prompt": data.get("negative_prompt")
             })
-    valid_sizes = ["1024x1024", "512x1024", "768x512", "768x1024", "1024x576", "576x1024", "960x1280", "720x1440",
-                   "720x1280"]
+    valid_sizes = ["1024x1024", "512x1024", "768x512", "768x1024", "1024x576", "576x1024", "960x1280", "720x1440", "720x1280"]
     if "image_size" in siliconflow_data and siliconflow_data["image_size"] not in valid_sizes:
         siliconflow_data["image_size"] = "1024x1024"
     return siliconflow_data
-
-# 刷新模型列表的函数
 def refresh_models():
     global models
-
-    # 使用线程池并发获取模型列表
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {
-            executor.submit(get_all_models, FREE_MODEL_TEST_KEY, "chat"): "text",
-            executor.submit(get_all_models, FREE_MODEL_TEST_KEY, "embedding"): "embedding",
-            executor.submit(get_all_models, FREE_MODEL_TEST_KEY, "text-to-image"): "image"
-        }
-
-        for future in concurrent.futures.as_completed(futures):
-            model_type = futures[future]
-            try:
-                models[model_type] = future.result()
-            except Exception as exc:
-                logging.error(f"获取 {model_type} 模型列表失败: {exc}")
-                models[model_type] = []
-
-    models["free_text"] = []
-    models["free_embedding"] = []
-    models["free_image"] = []
+    models["text"] = get_all_models(FREE_MODEL_TEST_KEY, "chat")
+    models["free_text"] = [model for model in models["text"] if model.endswith(":free")]
+    
     ban_models = []
     ban_models_str = os.environ.get("BAN_MODELS")
     if ban_models_str:
@@ -271,37 +343,12 @@ def refresh_models():
                 ban_models = []
         except json.JSONDecodeError:
             logging.warning("环境变量 BAN_MODELS JSON 解析失败，请检查格式。")
+    
     models["text"] = [model for model in models["text"] if model not in ban_models]
-    models["embedding"] = [model for model in models["embedding"] if model not in ban_models]
-    models["image"] = [model for model in models["image"] if model not in ban_models]
-    model_types = [
-        ("text", "chat"),
-        ("embedding", "embedding"),
-        ("image", "image")
-    ]
-    for model_type, test_type in model_types:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10000) as executor:
-            future_to_model = {
-                executor.submit(
-                    test_model_availability,
-                    FREE_MODEL_TEST_KEY,
-                    model,
-                    test_type
-                ): model for model in models[model_type]
-            }
-            for future in concurrent.futures.as_completed(future_to_model):
-                model = future_to_model[future]
-                try:
-                    is_free = future.result()
-                    if is_free:
-                        models[f"free_{model_type}"].append(model)
-                except Exception as exc:
-                    logging.error(f"{model_type}模型 {model} 测试生成异常: {exc}")
-    for model_type in ["text", "embedding", "image"]:
-        logging.info(f"所有{model_type}模型列表：{models[model_type]}")
-        logging.info(f"免费{model_type}模型列表：{models[f'free_{model_type}']}")
-
-# 加载 API 密钥的函数
+    models["free_text"] = [model for model in models["free_text"] if model not in ban_models]
+    
+    logging.info(f"所有text模型列表：{models['text']}")
+    logging.info(f"免费text模型列表：{models['free_text']}")
 def load_keys():
     global key_status
     for status in key_status:
@@ -314,33 +361,25 @@ def load_keys():
     unique_keys = list(set(key.strip() for key in keys_str.split(',')))
     os.environ["KEYS"] = ','.join(unique_keys)
     logging.info(f"加载的 keys：{unique_keys}")
-
-    # 使用线程池并发处理密钥
+    def process_key_with_logging(key):
+        try:
+            key_type = process_key(key, test_model)
+            if key_type in key_status:
+                key_status[key_type].append(key)
+            return key_type
+        except Exception as exc:
+            logging.error(f"处理 KEY {key} 生成异常: {exc}")
+            return "invalid"
     with concurrent.futures.ThreadPoolExecutor(max_workers=10000) as executor:
-        futures = [executor.submit(process_key_with_logging, key, test_model) for key in unique_keys]
+        futures = [executor.submit(process_key_with_logging, key) for key in unique_keys]
         concurrent.futures.wait(futures)
-
     for status, keys in key_status.items():
         logging.info(f"{status.capitalize()} KEYS: {keys}")
-
     global invalid_keys_global, free_keys_global, unverified_keys_global, valid_keys_global
     invalid_keys_global = key_status["invalid"]
     free_keys_global = key_status["free"]
     unverified_keys_global = key_status["unverified"]
     valid_keys_global = key_status["valid"]
-
-# 对单个密钥进行处理的辅助函数
-def process_key_with_logging(key, test_model):
-    try:
-        key_type = process_key(key, test_model)
-        if key_type in key_status:
-            key_status[key_type].append(key)
-        return key_type
-    except Exception as exc:
-        logging.error(f"处理 KEY {key} 生成异常: {exc}")
-        return "invalid"
-
-# 处理 API 密钥的函数
 def process_key(key, test_model):
     credit_summary = get_credit_summary(key)
     if credit_summary is None:
@@ -354,8 +393,6 @@ def process_key(key, test_model):
                 return "valid"
             else:
                 return "unverified"
-
-# 获取所有模型列表的函数
 def get_all_models(api_key, sub_type):
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -364,20 +401,30 @@ def get_all_models(api_key, sub_type):
     try:
         response = session.get(
             MODELS_ENDPOINT,
-            headers=headers,
-            params={"sub_type": sub_type}
+            headers=headers
         )
         response.raise_for_status()
         data = response.json()
         if (
-                isinstance(data, dict) and
-                'data' in data and
-                isinstance(data['data'], list)
+            isinstance(data, dict) and
+            'data' in data and
+            isinstance(data['data'], list)
         ):
-            return [
-                model.get("id") for model in data["data"]
-                if isinstance(model, dict) and "id" in model
-            ]
+            models_list = []
+            for model in data['data']:
+                if isinstance(model, dict):
+                    model_id = model.get("id")
+                    if model_id:
+                        models_list.append(model_id)
+                        # 如果模型有免费版本，添加免费版本到列表中
+                        if not model_id.endswith(":free"):
+                            models_list.append(f"{model_id}:free")
+            
+            logging.info(
+                f"获取模型列表成功，"
+                f"共{len(models_list)}个模型"
+            )
+            return models_list
         else:
             logging.error("获取模型列表失败：响应数据格式不正确")
             return []
@@ -393,36 +440,32 @@ def get_all_models(api_key, sub_type):
             f"API Key：{api_key}，错误信息：{e}"
         )
         return []
-
-# 确定请求类型的函数
 def determine_request_type(model_name, model_list, free_model_list):
-    if model_name in free_model_list:
+    if model_name.endswith(":free"):
         return "free"
     elif model_name in model_list:
         return "paid"
     else:
         return "unknown"
-
-# 选择 API 密钥的函数
 def select_key(request_type, model_name):
     if request_type == "free":
         available_keys = (
-                free_keys_global +
-                unverified_keys_global +
-                valid_keys_global
+            free_keys_global +
+            unverified_keys_global +
+            valid_keys_global
         )
     elif request_type == "paid":
         available_keys = unverified_keys_global + valid_keys_global
     else:
         available_keys = (
-                free_keys_global +
-                unverified_keys_global +
-                valid_keys_global
+            free_keys_global +
+            unverified_keys_global +
+            valid_keys_global
         )
     if not available_keys:
         return None
     current_index = model_key_indices.get(model_name, 0)
-    for _ in range(len(available_keys)):
+    for _ in range(len(available_keys)): # Corrected line: _in changed to _
         key = available_keys[current_index % len(available_keys)]
         current_index += 1
         if key_is_valid(key, request_type):
@@ -434,8 +477,6 @@ def select_key(request_type, model_name):
             )
     model_key_indices[model_name] = 0
     return None
-
-# 检查 API 密钥是否有效的函数
 def key_is_valid(key, request_type):
     if request_type == "invalid":
         return False
@@ -445,12 +486,10 @@ def key_is_valid(key, request_type):
     total_balance = credit_summary.get("total_balance", 0)
     if request_type == "free":
         return True
-    elif request_type == "paid" or request_type == "unverified":  # Fixed typo here
+    elif request_type == "paid" or request_type == "unverified": #Fixed typo here
         return total_balance > 0
     else:
         return False
-
-# 检查请求授权的函数
 def check_authorization(request):
     authorization_key = os.environ.get("AUTHORIZATION_KEY")
     if not authorization_key:
@@ -465,27 +504,121 @@ def check_authorization(request):
         return False
     return True
 
-# 对 API 密钥进行打码处理的函数
 def obfuscate_key(key):
     if not key:
         return "****"
     prefix_length = 6
     suffix_length = 4
     if len(key) <= prefix_length + suffix_length:
-        return "****"  # If key is too short, just mask it all
+        return "****" # If key is too short, just mask it all
     prefix = key[:prefix_length]
     suffix = key[-suffix_length:]
     masked_part = "*" * (len(key) - prefix_length - suffix_length)
     return prefix + masked_part + suffix
 
-# 设置后台调度器，用于定期加载密钥和刷新模型列表
 scheduler = BackgroundScheduler()
 scheduler.add_job(load_keys, 'interval', hours=1)
 scheduler.remove_all_jobs()
 scheduler.add_job(refresh_models, 'interval', hours=1)
 
-# Flask 应用的路由定义
+@app.route(f'{API_PREFIX}/ping', methods=['GET'])
+@app.route('/ping', methods=['GET'])
+def ping():
+    """返回服务运行状态信息，不记入日志"""
+    uptime = datetime.now() - SERVICE_START_TIME
+    # 格式化运行时间
+    days, seconds = uptime.days, uptime.seconds
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    seconds = seconds % 60
+    uptime_str = f"{days}天 {hours}小时 {minutes}分钟 {seconds}秒"
+    
+    # 统计有效API密钥数量
+    valid_keys_count = len(valid_keys_global) if 'valid_keys_global' in globals() else 0
+    free_keys_count = len(free_keys_global) if 'free_keys_global' in globals() else 0
+    unverified_keys_count = len(unverified_keys_global) if 'unverified_keys_global' in globals() else 0
+    
+    # 获取系统信息
+    try:
+        cpu_usage = psutil.cpu_percent(interval=1)
+        memory = psutil.virtual_memory()
+        memory_usage = {
+            "total": f"{memory.total / (1024**3):.2f} GB",
+            "available": f"{memory.available / (1024**3):.2f} GB", 
+            "percent": f"{memory.percent}%"
+        }
+        disk = psutil.disk_usage('/')
+        disk_usage = {
+            "total": f"{disk.total / (1024**3):.2f} GB",
+            "free": f"{disk.free / (1024**3):.2f} GB",
+            "percent": f"{disk.percent}%"
+        }
+    except ImportError:
+        # 如果psutil未安装
+        cpu_usage = "psutil未安装"
+        memory_usage = "psutil未安装"
+        disk_usage = "psutil未安装"
+    except Exception as e:
+        cpu_usage = f"获取失败: {str(e)}"
+        memory_usage = f"获取失败: {str(e)}"
+        disk_usage = f"获取失败: {str(e)}"
+    
+    # 统计可用模型数量
+    models_count = {
+        "text": len(models["text"]),
+        "free_text": len(models["free_text"])
+    }
+    
+    # 获取请求统计信息
+    current_time = time.time()
+    one_minute_ago = current_time - 60
+    one_day_ago = current_time - 86400
+    with data_lock:
+        while request_timestamps and request_timestamps[0] < one_minute_ago:
+            request_timestamps.pop(0)
+            token_counts.pop(0)
+        rpm = len(request_timestamps)
+        tpm = sum(token_counts)
+    with data_lock:
+        while request_timestamps_day and request_timestamps_day[0] < one_day_ago:
+            request_timestamps_day.pop(0)
+            token_counts_day.pop(0)
+        rpd = len(request_timestamps_day)
+        tpd = sum(token_counts_day)
+    
+    status_info = {
+        "status": "running",
+        "service": {
+            "start_time": SERVICE_START_TIME.strftime("%Y-%m-%d %H:%M:%S"),
+            "uptime": uptime_str,
+        },
+        "system": {
+            "platform": platform.platform(),
+            "python_version": platform.python_version(),
+            "cpu_usage": cpu_usage,
+            "memory_usage": memory_usage,
+            "disk_usage": disk_usage
+        },
+        "api_keys": {
+            "valid": valid_keys_count,
+            "free": free_keys_count,
+            "unverified": unverified_keys_count,
+            "total": valid_keys_count + free_keys_count + unverified_keys_count
+        },
+        "models": models_count,
+        "requests": {
+            "per_minute": rpm,
+            "per_day": rpd,
+            "tokens_per_minute": tpm,
+            "tokens_per_day": tpd
+        },
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    
+    return jsonify(status_info)
+
 @app.route('/')
+
 def index():
     current_time = time.time()
     one_minute_ago = current_time - 60
@@ -503,7 +636,6 @@ def index():
         rpd = len(request_timestamps_day)
         tpd = sum(token_counts_day)
 
-    # 并发获取所有密钥的余额信息
     key_balances = []
     all_keys = list(chain(*key_status.values()))
     with concurrent.futures.ThreadPoolExecutor(max_workers=10000) as executor:
@@ -513,27 +645,31 @@ def index():
             try:
                 credit_summary = future.result()
                 balance = credit_summary.get("total_balance") if credit_summary else "获取失败"
-                key_balances.append({"key": obfuscate_key(key), "balance": balance})
+                # 添加免费请求计数到返回数据中
+                free_requests = get_free_requests_count(key)
+                key_balances.append({
+                    "key": obfuscate_key(key), 
+                    "balance": balance,
+                    "free_requests": free_requests
+                })
             except Exception as exc:
                 logging.error(f"获取 KEY {obfuscate_key(key)} 余额信息失败: {exc}")
-                key_balances.append({"key": obfuscate_key(key), "balance": "获取失败"})
+                key_balances.append({
+                    "key": obfuscate_key(key), 
+                    "balance": "获取失败",
+                    "free_requests": get_free_requests_count(key)
+                })
 
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return render_template('index.html', rpm=rpm, tpm=tpm, rpd=rpd, tpd=tpd, key_balances=key_balances,
-                           now=now)
+    return render_template('index.html', rpm=rpm, tpm=tpm, rpd=rpd, tpd=tpd, key_balances=key_balances) # Render template instead of jsonify
 
-# 去除了 /env_test 路由
-
-# 列出所有可用模型的路由，去除了 /handsome 前缀
-@app.route('/v1/models', methods=['GET'])
+@app.route(f'{API_PREFIX}/models', methods=['GET'])
+@app.route(f'{API_PREFIX}/v1/models', methods=['GET'])
 def list_models():
     if not check_authorization(request):
         return jsonify({"error": "Unauthorized"}), 401
     detailed_models = []
     all_models = chain(
-        models["text"],
-        models["embedding"],
-        models["image"]
+        models["text"]
     )
     for model in all_models:
         model_data = {
@@ -565,13 +701,13 @@ def list_models():
                 "root": model + "-openwebui",
                 "parent": None
             })
-    return jsonify({
+    response = jsonify({
         "success": True,
         "data": detailed_models
     })
+    return response
 
-# 获取账单使用情况的路由，去除了 /handsome 前缀
-@app.route('/v1/dashboard/billing/usage', methods=['GET'])
+@app.route(f'{API_PREFIX}/v1/dashboard/billing/usage', methods=['GET'])
 def billing_usage():
     if not check_authorization(request):
         return jsonify({"error": "Unauthorized"}), 401
@@ -581,15 +717,15 @@ def billing_usage():
         "data": daily_usage,
         "total_usage": 0
     })
-
-# 获取账单订阅信息的路由，去除了 /handsome 前缀
-@app.route('/v1/dashboard/billing/subscription', methods=['GET'])
+@app.route(f'{API_PREFIX}/v1/dashboard/billing/subscription', methods=['GET'])
 def billing_subscription():
     if not check_authorization(request):
         return jsonify({"error": "Unauthorized"}), 401
     keys = valid_keys_global + unverified_keys_global
     total_balance = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10000) as executor:
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=10000
+    ) as executor:
         futures = [
             executor.submit(get_credit_summary, key) for key in keys
         ]
@@ -610,888 +746,373 @@ def billing_subscription():
         "hard_limit_usd": total_balance,
         "system_hard_limit_usd": total_balance
     })
-
-# 处理嵌入请求的路由，去除了 /handsome 前缀
-@app.route('/v1/embeddings', methods=['POST'])
-def handsome_embeddings():
-    if not check_authorization(request):
-        return jsonify({"error": "Unauthorized"}), 401
-    data = request.get_json()
-    if not data or 'model' not in data:
-        return jsonify({"error": "Invalid request data"}), 400
-    if data['model'] not in models["embedding"]:
-        return jsonify({"error": "Invalid model"}), 400
-    model_name = data['model']
-    request_type = determine_request_type(
-        model_name,
-        models["embedding"],
-        models["free_embedding"]
-    )
-    api_key = select_key(request_type, model_name)
-    if not api_key:
-        return jsonify(
-            {"error": ("No available API key for this request type or all keys have reached their limits")}), 429
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    try:
-        start_time = time.time()
-        response = requests.post(
-            EMBEDDINGS_ENDPOINT,
-            headers=headers,
-            json=data,
-            timeout=120
-        )
-        if response.status_code == 429:
-            return jsonify(response.json()), 429
-        response.raise_for_status()
-        end_time = time.time()
-        response_json = response.json()
-        total_time = end_time - start_time
-        try:
-            prompt_tokens = response_json["usage"]["prompt_tokens"]
-            embedding_data = response_json["data"]
-        except (KeyError, ValueError, IndexError) as e:
-            logging.error(
-                f"解析响应 JSON 失败: {e}, "
-                f"完整内容: {response_json}"
-            )
-            prompt_tokens = 0
-            embedding_data = []
-        logging.info(
-            f"使用的key: {api_key}, "
-            f"提示token: {prompt_tokens}, "
-            f"总共用时: {total_time:.4f}秒, "
-            f"使用的模型: {model_name}"
-        )
-        with data_lock:
-            request_timestamps.append(time.time())
-            token_counts.append(prompt_tokens)
-            request_timestamps_day.append(time.time())
-            token_counts_day.append(prompt_tokens)
-        return jsonify({
-            "object": "list",
-            "data": embedding_data,
-            "model": model_name,
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "total_tokens": prompt_tokens
-            }
-        })
-    except requests.exceptions.RequestException as e:
-        return jsonify({"error": str(e)}), 500
-
-# 处理图像生成请求的路由，去除了 /handsome 前缀
-@app.route('/v1/images/generations', methods=['POST'])
-def handsome_images_generations():
-    if not check_authorization(request):
-        return jsonify({"error": "Unauthorized"}), 401
-    data = request.get_json()
-    if not data or 'model' not in data:
-        return jsonify({"error": "Invalid request data"}), 400
-    if data['model'] not in models["image"]:
-        return jsonify({"error": "Invalid model"}), 400
-    model_name = data.get('model')
-    request_type = determine_request_type(
-        model_name,
-        models["image"],
-        models["free_image"]
-    )
-    api_key = select_key(request_type, model_name)
-    if not api_key:
-        return jsonify(
-            {"error": ("No available API key for this request type or all keys have reached their limits")}), 429
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    response_data = {}
-    if "stable-diffusion" in model_name or model_name in ["black-forest-labs/FLUX.1-schnell",
-                                                          "Pro/black-forest-labs/FLUX.1-schnell",
-                                                          "black-forest-labs/FLUX.1-dev",
-                                                          "black-forest-labs/FLUX.1-pro"]:
-        siliconflow_data = get_siliconflow_data(model_name, data)
-        try:
-            start_time = time.time()
-            response = requests.post(
-                IMAGE_ENDPOINT,
-                headers=headers,
-                json=siliconflow_data,
-                timeout=120
-            )
-            if response.status_code == 429:
-                return jsonify(response.json()), 429
-            response.raise_for_status()
-            end_time = time.time()
-            response_json = response.json()
-            total_time = end_time - start_time
-            try:
-                images = response_json.get("images", [])
-                openai_images = []
-                for item in images:
-                    if isinstance(item, dict) and "url" in item:
-                        image_url = item["url"]
-                        print(f"image_url: {image_url}")
-                        if data.get("response_format") == "b64_json":
-                            try:
-                                image_data = session.get(image_url, stream=True).raw
-                                image = Image.open(image_data)
-                                buffered = io.BytesIO()
-                                image.save(buffered, format="PNG")
-                                img_str = base64.b64encode(buffered.getvalue()).decode()
-                                openai_images.append({"b64_json": img_str})
-                            except Exception as e:
-                                logging.error(f"图片转base64失败: {e}")
-                                openai_images.append({"url": image_url})
-                        else:
-                            openai_images.append({"url": image_url})
-                    else:
-                        logging.error(f"无效的图片数据: {item}")
-                        openai_images.append({"url": item})
-                response_data = {
-                    "created": int(time.time()),
-                    "data": openai_images
-                }
-            except (KeyError, ValueError, IndexError) as e:
-                logging.error(
-                    f"解析响应 JSON 失败: {e}, "
-                    f"完整内容: {response_json}"
-                )
-                response_data = {
-                    "created": int(time.time()),
-                    "data": []
-                }
-            logging.info(
-                f"使用的key: {api_key}, "
-                f"总共用时: {total_time:.4f}秒, "
-                f"使用的模型: {model_name}"
-            )
-            with data_lock:
-                request_timestamps.append(time.time())
-                token_counts.append(0)
-                request_timestamps_day.append(time.time())
-                token_counts_day.append(0)
-            return jsonify(response_data)
-        except requests.exceptions.RequestException as e:
-            logging.error(f"请求转发异常: {e}")
-            return jsonify({"error": str(e)}), 500
-    else:
-        return jsonify({"error": "Unsupported model"}), 400
-
-# 处理聊天完成请求的路由，去除了 /handsome 前缀
-@app.route('/v1/chat/completions', methods=['POST'])
+@app.route(f'{API_PREFIX}/v1/chat/completions', methods=['POST'])
 def handsome_chat_completions():
-    if not check_authorization(request):
-        return jsonify({"error": "Unauthorized"}), 401
-    data = request.get_json()
-    if not data or 'model' not in data:
-        return jsonify({"error": "Invalid request data"}), 400
-    model_name = data['model']
-    if model_name not in models["text"] and model_name not in models["image"]:
-        if "DeepSeek-R1" in model_name and (model_name.endswith("-openwebui") or model_name.endswith("-thinking")):
-            pass
-        else:
+    try:
+        if not check_authorization(request):
+            return jsonify({"error": "Unauthorized"}), 401
+        
+        data = request.get_json()
+        if not data or 'model' not in data:
+            return jsonify({"error": "Invalid request data"}), 400
+        
+        model_name = data['model']
+        if (model_name not in models["text"] and
+            not ("DeepSeek-R1" in model_name and (model_name.endswith("-openwebui") or model_name.endswith("-thinking")))):
             return jsonify({"error": "Invalid model"}), 400
-    model_realname = model_name.replace("-thinking", "").replace("-openwebui", "")
-    request_type = determine_request_type(
-        model_realname,
-        models["text"] + models["image"],
-        models["free_text"] + models["free_image"]
-    )
-    api_key = select_key(request_type, model_name)
-    if not api_key:
-        return jsonify(
-            {
-                "error": (
-                    "No available API key for this "
-                    "request type or all keys have "
-                    "reached their limits"
-                )
-            }
-        ), 429
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    if "DeepSeek-R1" in model_name and ("thinking" in model_name or "openwebui" in model_name):
-        data['model'] = model_realname
-        start_time = time.time()
-        response = requests.post(
-            TEST_MODEL_ENDPOINT,
-            headers=headers,
-            json=data,
-            stream=data.get("stream", False),
-            timeout=120
-        )
-        if response.status_code == 429:
-            return jsonify(response.json()), 429
-        if data.get("stream", False):
-            def generate():
-                if model_name.endswith("-openwebui"):
-                    first_chunk_time = None
-                    full_response_content = ""
-                    reasoning_content_accumulated = ""
-                    content_accumulated = ""
-                    first_reasoning_chunk = True
-                    for chunk in response.iter_lines():
-                        if chunk:
-                            if first_chunk_time is None:
-                                first_chunk_time = time.time()
-                            full_response_content += chunk.decode("utf-8")
-                            for line in chunk.decode("utf-8").splitlines():
-                                if line.startswith("data:"):
-                                    try:
-                                        chunk_json = json.loads(line.lstrip("data: ").strip())
-                                        if "choices" in chunk_json and len(chunk_json["choices"]) > 0:
-                                            delta = chunk_json["choices"][0].get("delta", {})
-                                            if delta.get("reasoning_content") is not None:
-                                                reasoning_chunk = delta["reasoning_content"]
-                                                if first_reasoning_chunk:
-                                                    think_chunk = f"<"
-                                                    yield f"data: {json.dumps({'choices': [{'delta': {'content': think_chunk}, 'index': 0}]})}\n\n"
-                                                    think_chunk = f"think"
-                                                    yield f"data: {json.dumps({'choices': [{'delta': {'content': think_chunk}, 'index': 0}]})}\n\n"
-                                                    think_chunk = f">\n"
-                                                    yield f"data: {json.dumps({'choices': [{'delta': {'content': think_chunk}, 'index': 0}]})}\n\n"
-                                                    first_reasoning_chunk = False
-                                                yield f"data: {json.dumps({'choices': [{'delta': {'content': reasoning_chunk}, 'index': 0}]})}\n\n"
-                                            if delta.get("content") is not None:
-                                                if not first_reasoning_chunk:
-                                                    reasoning_chunk = f"\n</think>\n"
-                                                    yield f"data: {json.dumps({'choices': [{'delta': {'content': reasoning_chunk}, 'index': 0}]})}\n\n"
-                                                    first_reasoning_chunk = True
-                                                yield f"data: {json.dumps({'choices': [{'delta': {'content': delta["content"]}, 'index': 0}]})}\n\n"
-                                    except (KeyError, ValueError, json.JSONDecodeError) as e:
-                                        continue
-                    end_time = time.time()
-                    first_token_time = (
-                        first_chunk_time - start_time
-                        if first_chunk_time else 0
-                    )
-                    total_time = end_time - start_time
-                    prompt_tokens = 0
-                    completion_tokens = 0
-                    for line in full_response_content.splitlines():
-                        if line.startswith("data:"):
-                            line = line[5:].strip()
-                            if line == "[DONE]":
-                                continue
-                            try:
-                                response_json = json.loads(line)
-                                if (
-                                        "usage" in response_json and
-                                        "completion_tokens" in response_json["usage"]
-                                ):
-                                    completion_tokens += response_json[
-                                        "usage"
-                                    ]["completion_tokens"]
-                                if (
-                                        "usage" in response_json and
-                                        "prompt_tokens" in response_json["usage"]
-                                ):
-                                    prompt_tokens = response_json[
-                                        "usage"
-                                    ]["prompt_tokens"]
-                            except (KeyError, ValueError, IndexError) as e:
-                                pass
-                    user_content = ""
-                    messages = data.get("messages", [])
-                    for message in messages:
-                        if message["role"] == "user":
-                            if isinstance(message["content"], str):
-                                user_content += message["content"] + " "
-                            elif isinstance(message["content"], list):
-                                for item in message["content"]:
-                                    if (
-                                            isinstance(item, dict) and
-                                            item.get("type") == "text"
-                                    ):
-                                        user_content += (
-                                                item.get("text", "") +
-                                                " "
-                                        )
-                    user_content = user_content.strip()
-                    user_content_replaced = user_content.replace(
-                        '\n', '\\n'
-                    ).replace('\r', '\\n')
-                    response_content_replaced = (
-                                                            f"```Thinking\n{reasoning_content_accumulated}\n```\n" if reasoning_content_accumulated else "") + content_accumulated
-                    response_content_replaced = response_content_replaced.replace(
-                        '\n', '\\n'
-                    ).replace('\r', '\\n')
-                    logging.info(
-                        f"使用的key: {api_key}, "
-                        f"提示token: {prompt_tokens}, "
-                        f"输出token: {completion_tokens}, "
-                        f"首字用时: {first_token_time:.4f}秒, "
-                        f"总共用时: {total_time:.4f}秒, "
-                        f"使用的模型: {model_name}, "
-                        f"用户的内容: {user_content_replaced}, "
-                        f"输出的内容: {response_content_replaced}"
-                    )
-                    with data_lock:
-                        request_timestamps.append(time.time())
-                        token_counts.append(prompt_tokens + completion_tokens)
-                    yield "data: [DONE]\n\n"
-                    return Response(
-                        stream_with_context(generate()),
-                        content_type="text/event-stream"
-                    )
-                first_chunk_time = None
-                full_response_content = ""
-                reasoning_content_accumulated = ""
-                content_accumulated = ""
-                first_reasoning_chunk = True
-                for chunk in response.iter_lines():
-                    if chunk:
-                        if first_chunk_time is None:
-                            first_chunk_time = time.time()
-                        full_response_content += chunk.decode("utf-8")
-                        for line in chunk.decode("utf-8").splitlines():
-                            if line.startswith("data:"):
-                                try:
-                                    chunk_json = json.loads(line.lstrip("data: ").strip())
-                                    if "choices" in chunk_json and len(chunk_json["choices"]) > 0:
-                                        delta = chunk_json["choices"][0].get("delta", {})
-                                        if delta.get("reasoning_content") is not None:
-                                            reasoning_chunk = delta["reasoning_content"]
-                                            reasoning_chunk = reasoning_chunk.replace('\n', '\n> ')
-                                            if first_reasoning_chunk:
-                                                reasoning_chunk = "> " + reasoning_chunk
-                                                first_reasoning_chunk = False
-                                            yield f"data: {json.dumps({'choices': [{'delta': {'content': reasoning_chunk}, 'index': 0}]})}\n\n"
-                                        if delta.get("content") is not None:
-                                            if not first_reasoning_chunk:
-                                                yield f"data: {json.dumps({'choices': [{'delta': {'content': '\n\n'}, 'index': 0}]})}\n\n"
-                                                first_reasoning_chunk = True
-                                            yield f"data: {json.dumps({'choices': [{'delta': {'content': delta["content"]}, 'index': 0}]})}\n\n"
-                                except (KeyError, ValueError, json.JSONDecodeError) as e:
-                                    continue
-                end_time = time.time()
-                first_token_time = (
-                        first_chunk_time - start_time
-                        if first_chunk_time else 0
-                )
-                total_time = end_time - start_time
-                prompt_tokens = 0
-                completion_tokens = 0
-                for line in full_response_content.splitlines():
-                    if line.startswith("data:"):
-                        line = line[5:].strip()
-                        if line == "[DONE]":
-                            continue
-                        try:
-                            response_json = json.loads(line)
-                            if (
-                                    "usage" in response_json and
-                                    "completion_tokens" in response_json["usage"]
-                            ):
-                                completion_tokens += response_json[
-                                    "usage"
-                                ]["completion_tokens"]
-                            if (
-                                    "usage" in response_json and
-                                    "prompt_tokens" in response_json["usage"]
-                            ):
-                                prompt_tokens = response_json[
-                                    "usage"
-                                ]["prompt_tokens"]
-                        except (KeyError, ValueError, IndexError) as e:
-                            pass
-                user_content = ""
-                messages = data.get("messages", [])
-                for message in messages:
-                    if message["role"] == "user":
-                        if isinstance(message["content"], str):
-                            user_content += message["content"] + " "
-                        elif isinstance(message["content"], list):
-                            for item in message["content"]:
-                                if (
-                                        isinstance(item, dict) and
-                                        item.get("type") == "text"
-                                ):
-                                    user_content += (
-                                            item.get("text", "") +
-                                            " "
-                                    )
-                user_content = user_content.strip()
-                user_content_replaced = user_content.replace(
-                    '\n', '\\n'
-                ).replace('\r', '\\n')
-                response_content_replaced = (
-                                                    f"```Thinking\n{reasoning_content_accumulated}\n```\n" if reasoning_content_accumulated else "") + content_accumulated
-                response_content_replaced = response_content_replaced.replace(
-                    '\n', '\\n'
-                ).replace('\r', '\\n')
-                logging.info(
-                    f"使用的key: {api_key}, "
-                    f"提示token: {prompt_tokens}, "
-                    f"输出token: {completion_tokens}, "
-                    f"首字用时: {first_token_time:.4f}秒, "
-                    f"总共用时: {total_time:.4f}秒, "
-                    f"使用的模型: {model_name}, "
-                    f"用户的内容: {user_content_replaced}, "
-                    f"输出的内容: {response_content_replaced}"
-                )
-                with data_lock:
-                    request_timestamps.append(time.time())
-                    token_counts.append(prompt_tokens + completion_tokens)
-                yield "data: [DONE]\n\n"
-            return Response(
-                stream_with_context(generate()),
-                content_type="text/event-stream"
-            )
         else:
-            response.raise_for_status()
-            end_time = time.time()
-            response_json = response.json()
-            total_time = end_time - start_time
-            try:
-                prompt_tokens = response_json["usage"]["prompt_tokens"]
-                completion_tokens = response_json["usage"]["completion_tokens"]
-                response_content = ""
-                if model_name.endswith("-thinking") and "choices" in response_json and len(
-                        response_json["choices"]) > 0:
-                    choice = response_json["choices"][0]
-                    if "message" in choice:
-                        if "reasoning_content" in choice["message"]:
-                            reasoning_content = choice["message"]["reasoning_content"]
-                            reasoning_content = reasoning_content.replace('\n', '\n> ')
-                            reasoning_content = '> ' + reasoning_content
-                            formatted_reasoning = f"{reasoning_content}\n"
-                            response_content += formatted_reasoning + "\n"
-                        if "content" in choice["message"]:
-                            response_content += choice["message"]["content"]
-                elif model_name.endswith("-openwebui") and "choices" in response_json and len(
-                        response_json["choices"]) > 0:
-                    choice = response_json["choices"][0]
-                    if "message" in choice:
-                        if "reasoning_content" in choice["message"]:
-                            reasoning_content = choice["message"]["reasoning_content"]
-                            response_content += f"<think>\n{reasoning_content}\n</think>\n"
-                        if "content" in choice["message"]:
-                            response_content += choice["message"]["content"]
-            except (KeyError, ValueError, IndexError) as e:
-                logging.error(
-                    f"解析非流式响应 JSON 失败: {e}, "
-                    f"完整内容: {response_json}"
-                )
-                prompt_tokens = 0
-                completion_tokens = 0
-                response_content = ""
-            user_content = ""
-            messages = data.get("messages", [])
-            for message in messages:
-                if message["role"] == "user":
-                    if isinstance(message["content"], str):
-                        user_content += message["content"] + " "
-                    elif isinstance(message["content"], list):
-                        for item in message["content"]:
-                            if (
-                                    isinstance(item, dict) and
-                                    item.get("type") == "text"
-                            ):
-                                user_content += (
-                                        item.get("text", "") +
-                                        " "
-                                )
-            user_content = user_content.strip()
-            user_content_replaced = user_content.replace(
-                '\n', '\\n'
-            ).replace('\r', '\\n')
-            response_content_replaced = response_content.replace(
-                '\n', '\\n'
-            ).replace('\r', '\\n')
-            logging.info(
-                f"使用的key: {api_key}, "
-                f"提示token: {prompt_tokens}, "
-                f"输出token: {completion_tokens}, "
-                f"首字用时: 0, "
-                f"总共用时: {total_time:.4f}秒, "
-                f"使用的模型: {model_name}, "
-                f"用户的内容: {user_content_replaced}, "
-                f"输出的内容: {response_content_replaced}"
-            )
-            with data_lock:
-                request_timestamps.append(time.time())
-                token_counts.append(prompt_tokens + completion_tokens)
-            formatted_response = {
-                "id": response_json.get("id", ""),
-                "object": "chat.completion",
-                "created": response_json.get("created", int(time.time())),
-                "model": model_name,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": response_content
-                        },
-                        "finish_reason": "stop"
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": prompt_tokens + completion_tokens
-                }
-            }
-            return jsonify(formatted_response)
-    if model_name in models["image"]:
-        if isinstance(data.get("messages"), list):
-            data = data.copy()
-            data["prompt"] = extract_user_content(data["messages"])
-        siliconflow_data = get_siliconflow_data(model_name, data)
+            model_realname = model_name.replace("-thinking", "").replace("-openwebui", "") if "DeepSeek-R1" in model_name else model_name
+            
+        request_type = determine_request_type(
+            model_realname,
+            models["text"],
+            models["free_text"]
+        )
+        
+        # 检查是否有针对此模型的提供商路由配置
+        provider_routing = get_model_provider_routing(model_name)
+        
+        # 如果存在特定模型的提供商路由配置，添加到请求中
+        if (provider_routing):
+            # 确保data中有provider字段，如果没有则初始化为空字典
+            if 'provider' not in data:
+                data['provider'] = {}
+            
+            # 如果是列表，则设置为order
+            if isinstance(provider_routing, list):
+                data['provider']['order'] = provider_routing
+                logging.info(f"应用模型 {model_name} 的提供商路由配置: {provider_routing}")
+            # 如果是字典（完整的provider配置），则直接使用
+            elif isinstance(provider_routing, dict):
+                data['provider'] = provider_routing
+                logging.info(f"应用模型 {model_name} 的完整提供商配置: {provider_routing}")
+        
+        api_key = select_key(request_type, model_name)
+        if not api_key:
+            return jsonify({
+                "error": "No available API key for this request type or all keys have reached their limits"
+            }), 429
+        
+        # 检查免费请求限制
+        if request_type == "free":
+            current_count = increment_free_requests(api_key)
+            if current_count > FREE_REQUESTS_LIMIT:
+                logging.warning(f"API密钥 {obfuscate_key(api_key)} 已达到每日免费请求限制")
+                return jsonify({
+                    "error": "Daily free request limit exceeded"
+                }), 429
+            
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        start_time = time.time()
         try:
-            start_time = time.time()
-            response = requests.post(
-                IMAGE_ENDPOINT,
-                headers=headers,
-                json=siliconflow_data,
-                stream=data.get("stream", False)
-            )
-            if response.status_code == 429:
-                return jsonify(response.json()), 429
-            if data.get("stream", False):
-                def generate():
-                    try:
-                        response.raise_for_status()
-                        response_json = response.json()
-                        images = response_json.get("images", [])
-                        image_url = ""
-                        if images and isinstance(images[0], dict) and "url" in images[0]:
-                            image_url = images[0]["url"]
-                            logging.info(f"Extracted image URL: {image_url}")
-                        elif images and isinstance(images[0], str):
-                            image_url = images[0]
-                            logging.info(f"Extracted image URL: {image_url}")
-                        markdown_image_link = create_base64_markdown_image(image_url)
-                        if image_url:
-                            chunk_size = 8192
-                            for i in range(0, len(markdown_image_link), chunk_size):
-                                chunk = markdown_image_link[i:i + chunk_size]
-                                chunk_data = {
-                                    "id": f"chatcmpl-{uuid.uuid4()}",
-                                    "object": "chat.completion.chunk",
-                                    "created": int(time.time()),
-                                    "model": model_name,
-                                    "choices": [
-                                        {
-                                            "index": 0,
-                                            "delta": {
-                                                "role": "assistant",
-                                                "content": chunk
-                                            },
-                                            "finish_reason": None
-                                        }
-                                    ]
-                                }
-                                yield f"data: {json.dumps(chunk_data)}\n\n".encode('utf-8')
-                        else:
-                            chunk_data = {
-                                "id": f"chatcmpl-{uuid.uuid4()}",
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": model_name,
-                                "choices": [
-                                    {
-                                        "index": 0,
-                                        "delta": {
-                                            "role": "assistant",
-                                            "content": "Failed to generate image"
-                                        },
-                                        "finish_reason": None
-                                    }
-                                ]
-                            }
-                            yield f"data: {json.dumps(chunk_data)}\n\n".encode('utf-8')
-                        end_chunk_data = {
-                            "id": f"chatcmpl-{uuid.uuid4()}",
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": model_name,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {},
-                                    "finish_reason": "stop"
-                                }
-                            ]
-                        }
-                        yield f"data: {json.dumps(end_chunk_data)}\n\n".encode('utf-8')
-                        with data_lock:
-                            request_timestamps.append(time.time())
-                            token_counts.append(0)
-                            request_timestamps_day.append(time.time())
-                            token_counts_day.append(0)
-                    except requests.exceptions.RequestException as e:
-                        logging.error(f"请求转发异常: {e}")
-                        error_chunk_data = {
-                            "id": f"chatcmpl-{uuid.uuid4()}",
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": model_name,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "role": "assistant",
-                                        "content": f"Error: {str(e)}"
-                                    },
-                                    "finish_reason": None
-                                }
-                            ]
-                        }
-                        yield f"data: {json.dumps(error_chunk_data)}\n\n".encode('utf-8')
-                        end_chunk_data = {
-                            "id": f"chatcmpl-{uuid.uuid4()}",
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": model_name,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {},
-                                    "finish_reason": "stop"
-                                }
-                            ]
-                        }
-                        yield f"data: {json.dumps(end_chunk_data)}\n\n".encode('utf-8')
-                    logging.info(
-                        f"使用的key: {api_key}, "
-                        f"使用的模型: {model_name}"
-                    )
-                    yield "data: [DONE]\n\n".encode('utf-8')
-                return Response(stream_with_context(generate()), content_type='text/event-stream')
-            else:
-                response.raise_for_status()
-                end_time = time.time()
-                response_json = response.json()
-                total_time = end_time - start_time
-                try:
-                    images = response_json.get("images", [])
-                    image_url = ""
-                    if images and isinstance(images[0], dict) and "url" in images[0]:
-                        image_url = images[0]["url"]
-                        logging.info(f"Extracted image URL: {image_url}")
-                    elif images and isinstance(images[0], str):
-                        image_url = images[0]
-                        logging.info(f"Extracted image URL: {image_url}")
-                    markdown_image_link = f"![image]({image_url})"
-                    response_data = {
-                        "id": f"chatcmpl-{uuid.uuid4()}",
-                        "object": "chat.completion",
-                        "created": int(time.time()),
-                        "model": model_name,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "message": {
-                                    "role": "assistant",
-                                    "content": markdown_image_link if image_url else "Failed to generate image",
-                                },
-                                "finish_reason": "stop",
-                            }
-                        ],
-                    }
-                except (KeyError, ValueError, IndexError) as e:
-                    logging.error(
-                        f"解析响应 JSON 失败: {e}, "
-                        f"完整内容: {response_json}"
-                    )
-                    response_data = {
-                        "id": f"chatcmpl-{uuid.uuid4()}",
-                        "object": "chat.completion",
-                        "created": int(time.time()),
-                        "model": model_name,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "message": {
-                                    "role": "assistant",
-                                    "content": "Failed to process image data",
-                                },
-                                "finish_reason": "stop",
-                            }
-                        ],
-                    }
-                logging.info(
-                    f"使用的key: {api_key}, "
-                    f"总共用时: {total_time:.4f}秒, "
-                    f"使用的模型: {model_name}"
-                )
-                with data_lock:
-                    request_timestamps.append(time.time())
-                    token_counts.append(0)
-                    request_timestamps_day.append(time.time())
-                    token_counts_day.append(0)
-                return jsonify(response_data)
-        except requests.exceptions.RequestException as e:
-            logging.error(f"请求转发异常: {e}")
-            return jsonify({"error": str(e)}), 500
-    else:
-        try:
-            start_time = time.time()
             response = requests.post(
                 TEST_MODEL_ENDPOINT,
                 headers=headers,
                 json=data,
-                stream=data.get("stream", False)
+                stream=data.get("stream", False),
+                timeout=None
             )
+            response.raise_for_status()
+            
             if response.status_code == 429:
                 return jsonify(response.json()), 429
+                
             if data.get("stream", False):
-                def generate():
-                    first_chunk_time = None
-                    full_response_content = ""
-                    for chunk in response.iter_content(chunk_size=2048):
-                        if chunk:
-                            if first_chunk_time is None:
-                                first_chunk_time = time.time()
-                            full_response_content += chunk.decode("utf-8")
-                            yield chunk
-                    end_time = time.time()
-                    first_token_time = (
-                            first_chunk_time - start_time
-                            if first_chunk_time else 0
-                    )
-                    total_time = end_time - start_time
-                    prompt_tokens = 0
-                    completion_tokens = 0
-                    response_content = ""
-                    for line in full_response_content.splitlines():
-                        if line.startswith("data:"):
-                            line = line[5:].strip()
-                            if line == "[DONE]":
-                                continue
-                            try:
-                                response_json = json.loads(line)
-                                if (
-                                        "usage" in response_json and
-                                        "completion_tokens" in response_json["usage"]
-                                ):
-                                    completion_tokens = response_json[
-                                        "usage"
-                                    ]["completion_tokens"]
-                                if (
-                                        "choices" in response_json and
-                                        len(response_json["choices"]) > 0 and
-                                        "delta" in response_json["choices"][0] and
-                                        "content" in response_json[
-                                            "choices"
-                                        ][0]["delta"]
-                                ):
-                                    response_content += response_json[
-                                        "choices"
-                                    ][0]["delta"]["content"]
-                                if (
-                                        "usage" in response_json and
-                                        "prompt_tokens" in response_json["usage"]
-                                ):
-                                    prompt_tokens = response_json[
-                                        "usage"
-                                    ]["prompt_tokens"]
-                            except (
-                                    KeyError,
-                                    ValueError,
-                                    IndexError
-                            ) as e:
-                                logging.error(
-                                    f"解析流式响应单行 JSON 失败: {e}, "
-                                    f"行内容: {line}"
-                                )
-                    user_content = extract_user_content(data.get("messages", []))
-                    user_content_replaced = user_content.replace(
-                        '\n', '\\n'
-                    ).replace('\r', '\\n')
-                    response_content_replaced = response_content.replace(
-                        '\n', '\\n'
-                    ).replace('\r', '\\n')
-                    logging.info(
-                        f"使用的key: {api_key}, "
-                        f"提示token: {prompt_tokens}, "
-                        f"输出token: {completion_tokens}, "
-                        f"首字用时: {first_token_time:.4f}秒, "
-                        f"总共用时: {total_time:.4f}秒, "
-                        f"使用的模型: {model_name}, "
-                        f"用户的内容: {user_content_replaced}, "
-                        f"输出的内容: {response_content_replaced}"
-                    )
-                    with data_lock:
-                        request_timestamps.append(time.time())
-                        token_counts.append(prompt_tokens + completion_tokens)
-                        request_timestamps_day.append(time.time())
-                        token_counts_day.append(prompt_tokens + completion_tokens)
                 return Response(
-                    stream_with_context(generate()),
-                    content_type=response.headers['Content-Type']
+                    stream_with_context(generate_stream_response(
+                        response, start_time, data, api_key, model_name
+                    )),
+                    content_type="text/event-stream"
                 )
             else:
-                response.raise_for_status()
-                end_time = time.time()
                 response_json = response.json()
+                end_time = time.time()
                 total_time = end_time - start_time
-                try:
-                    prompt_tokens = response_json["usage"]["prompt_tokens"]
-                    completion_tokens = response_json[
-                        "usage"
-                    ]["completion_tokens"]
-                    response_content = response_json[
-                        "choices"
-                    ][0]["message"]["content"]
-                except (KeyError, ValueError, IndexError) as e:
-                    logging.error(
-                        f"解析非流式响应 JSON 失败: {e}, "
-                        f"完整内容: {response_json}"
-                    )
-                    prompt_tokens = 0
-                    completion_tokens = 0
-                    response_content = ""
+                
+                # 获取token使用情况
+                usage = response_json.get("usage", {})
+                prompt_tokens = usage.get("prompt_tokens", 0)
+                completion_tokens = usage.get("completion_tokens", 0)
+                
+                # 获取响应内容
+                choices = response_json.get("choices", [])
+                response_content = ""
+                if choices and choices[0].get("message"):
+                    response_content = choices[0]["message"].get("content", "")
+                
+                # 记录日志
                 user_content = extract_user_content(data.get("messages", []))
-                user_content_replaced = user_content.replace(
-                    '\n', '\\n'
-                ).replace('\r', '\\n')
-                response_content_replaced = response_content.replace(
-                    '\n', '\\n'
-                ).replace('\r', '\\n')
+                user_content_replaced = user_content.replace('\n', '\\n').replace('\r', '\\n')
+                response_content_replaced = response_content.replace('\n', '\\n').replace('\r', '\\n')
+                
                 logging.info(
                     f"使用的key: {api_key}, "
                     f"提示token: {prompt_tokens}, "
                     f"输出token: {completion_tokens}, "
-                    f"首字用时: 0, "
                     f"总共用时: {total_time:.4f}秒, "
                     f"使用的模型: {model_name}, "
                     f"用户的内容: {user_content_replaced}, "
                     f"输出的内容: {response_content_replaced}"
                 )
+                
+                # 更新统计信息
                 with data_lock:
                     request_timestamps.append(time.time())
-                    if "prompt_tokens" in response_json["usage"] and "completion_tokens" in response_json["usage"]:
-                        token_counts.append(
-                            response_json["usage"]["prompt_tokens"] + response_json["usage"]["completion_tokens"])
-                    else:
-                        token_counts.append(0)
+                    token_counts.append(prompt_tokens + completion_tokens)
                     request_timestamps_day.append(time.time())
-                    if "prompt_tokens" in response_json["usage"] and "completion_tokens" in response_json["usage"]:
-                        token_counts_day.append(
-                            response_json["usage"]["prompt_tokens"] + response_json["usage"]["completion_tokens"])
-                    else:
-                        token_counts_day.append(0)
+                    token_counts_day.append(prompt_tokens + completion_tokens)
+                
+                # 如果响应是空的，记录警告
+                if not response_content:
+                    logging.warning(f"模型 {model_name} 返回了空响应")
+                
+                # 直接返回原始响应
                 return jsonify(response_json)
+                
         except requests.exceptions.RequestException as e:
-            logging.error(f"请求转发异常: {e}")
-            return jsonify({"error": str(e)}), 500
+            logging.error(f"请求OpenRouter API失败: {str(e)}")
+            return jsonify({"error": "Failed to connect to OpenRouter API", "details": str(e)}), 502
+            
+    except Exception as e:
+        logging.error(f"处理请求时发生未预期的错误: {str(e)}")
+        return jsonify({"error": "Unexpected error", "details": str(e)}), 500
 
-# 初始化代码
-load_keys()
-logging.info("程序启动时首次加载 keys 已执行")
-scheduler.start()
-logging.info("首次加载 keys 已手动触发执行")
-refresh_models()
-logging.info("首次刷新模型列表已手动触发执行")
+def generate_stream_response(response, start_time, data, api_key, model_name):
+    first_chunk_time = None
+    full_response_content = ""
+    response_content = ""
+    buffer = ""  # 添加buffer来存储跨chunk的不完整数据
+    
+    try:
+        for chunk in response.iter_content(chunk_size=2048):
+            if chunk:
+                if first_chunk_time is None:
+                    first_chunk_time = time.time()
+                chunk_str = chunk.decode("utf-8", errors="replace")  # 添加错误处理
+                full_response_content += chunk_str
+                yield chunk
+                
+                # 将当前chunk添加到buffer
+                buffer += chunk_str
+                
+                # 处理buffer中完整的行
+                lines = buffer.split("\n")
+                # 最后一行可能不完整，保留在buffer中
+                buffer = lines.pop()
+                
+                for line in lines:
+                    line = line.strip()
+                    if line.startswith("data:") and not line.startswith("data: [DONE]"):
+                        try:
+                            data_content = line[5:].strip()
+                            if data_content:  # 确保不是空字符串
+                                line_json = json.loads(data_content)
+                                if (
+                                    "choices" in line_json and
+                                    len(line_json["choices"]) > 0 and
+                                    "delta" in line_json["choices"][0] and
+                                    "content" in line_json["choices"][0]["delta"]
+                                ):
+                                    response_content += line_json["choices"][0]["delta"]["content"]
+                        except json.JSONDecodeError as e:
+                            # 只有在不是已知的特殊消息时才记录警告
+                            if not (": OPENROUTER PROCESSING" in line or "data: [DONE]" in line):
+                                logging.debug(f"无法解析JSON行: {line[:100]}... 错误: {str(e)}")
+                            continue
+                        except (KeyError, IndexError) as e:
+                            logging.debug(f"处理解析后的JSON时出错: {str(e)}")
+                            continue
+                    elif line.startswith(": OPENROUTER PROCESSING") or line == "data: [DONE]":
+                        # 这是OpenRouter发送的保持连接的注释或结束标记，可以安全忽略
+                        pass
+                    
+        # 处理最后一个可能部分的行
+        if buffer.strip():
+            if buffer.startswith("data:") and not buffer.startswith("data: [DONE]"):
+                try:
+                    data_content = buffer[5:].strip()
+                    if data_content:
+                        line_json = json.loads(data_content)
+                        if (
+                            "choices" in line_json and
+                            len(line_json["choices"]) > 0 and
+                            "delta" in line_json["choices"][0] and
+                            "content" in line_json["choices"][0]["delta"]
+                        ):
+                            response_content += line_json["choices"][0]["delta"]["content"]
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    # 忽略最后不完整的行
+                    pass
+                    
+        end_time = time.time()
+        total_time = end_time - start_time
+        first_token_time = first_chunk_time - start_time if first_chunk_time else 0
+        
+        # 记录统计信息
+        log_completion_stats(
+            api_key, model_name, data, response_content,
+            full_response_content, total_time, first_token_time
+        )
+        
+    except Exception as e:
+        logging.error(f"生成流式响应时发生错误: {str(e)}")
+        raise
+
+def log_request_stats(api_key, model_name, prompt_tokens, completion_tokens, total_time, user_content, response_content):
+    """记录请求统计信息"""
+    try:
+        user_content_replaced = user_content.replace('\n', '\\n').replace('\r', '\\n')
+        response_content_replaced = response_content.replace('\n', '\\n').replace('\r', '\\n')
+        
+        logging.info(
+            f"使用的key: {api_key}, "
+            f"提示token: {prompt_tokens}, "
+            f"输出token: {completion_tokens}, "
+            f"总共用时: {total_time:.4f}秒, "
+            f"使用的模型: {model_name}, "
+            f"用户的内容: {user_content_replaced}, "
+            f"输出的内容: {response_content_replaced}"
+        )
+        
+        with data_lock:
+            request_timestamps.append(time.time())
+            token_counts.append(prompt_tokens + completion_tokens)
+            request_timestamps_day.append(time.time())
+            token_counts_day.append(prompt_tokens + completion_tokens)
+    except Exception as e:
+        logging.error(f"记录请求统计信息时发生错误: {str(e)}")
+
+def log_completion_stats(api_key, model_name, data, response_content, full_response_content, total_time, first_token_time):
+    try:
+        prompt_tokens = 0
+        completion_tokens = 0
+        
+        # 改进解析逻辑，更健壮地处理usage信息
+        for line in full_response_content.splitlines():
+            if line.startswith("data:") and "usage" in line:
+                try:
+                    data_content = line[5:].strip()
+                    if not data_content:
+                        continue
+                        
+                    line_json = json.loads(data_content)
+                    if "usage" in line_json:
+                        # 累加token数量，因为在流式响应中可能会有多个usage对象
+                        prompt_tokens = max(prompt_tokens, line_json["usage"].get("prompt_tokens", 0))
+                        new_completion = line_json["usage"].get("completion_tokens", 0)
+                        if new_completion > completion_tokens:
+                            completion_tokens = new_completion
+                except (json.JSONDecodeError, KeyError):
+                    continue
+                    
+        user_content = extract_user_content(data.get("messages", []))
+        user_content_replaced = user_content.replace('\n', '\\n').replace('\r', '\\n')
+        response_content_replaced = response_content.replace('\n', '\\n').replace('\r', '\\n')
+        
+        # 限制日志长度以防止过大的日志文件
+        if len(user_content_replaced) > 500:
+            user_content_replaced = user_content_replaced[:497] + "..."
+        if len(response_content_replaced) > 500:
+            response_content_replaced = response_content_replaced[:497] + "..."
+        
+        logging.info(
+            f"使用的key: {api_key}, "
+            f"提示token: {prompt_tokens}, "
+            f"输出token: {completion_tokens}, "
+            f"首字用时: {first_token_time:.4f}秒, "
+            f"总共用时: {total_time:.4f}秒, "
+            f"使用的模型: {model_name}, "
+            f"用户的内容: {user_content_replaced}, "
+            f"输出的内容: {response_content_replaced}"
+        )
+        
+        with data_lock:
+            request_timestamps.append(time.time())
+            token_counts.append(prompt_tokens + completion_tokens)
+            request_timestamps_day.append(time.time())
+            token_counts_day.append(prompt_tokens + completion_tokens)
+            
+    except Exception as e:
+        logging.error(f"记录完成统计信息时发生错误: {str(e)}")
+
+def process_normal_response(response, start_time, data, api_key, model_name):
+    """处理普通（非流式）响应"""
+    try:
+        end_time = time.time()
+        response_json = response.json()
+        total_time = end_time - start_time
+        
+        # 获取token使用情况
+        usage = response_json.get("usage", {})
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        
+        # 获取响应内容
+        choices = response_json.get("choices", [])
+        response_content = ""
+        if choices:
+            message = choices[0].get("message", {})
+            response_content = message.get("content", "")
+            
+        # 记录日志
+        user_content = extract_user_content(data.get("messages", []))
+        user_content_replaced = user_content.replace('\n', '\\n').replace('\r', '\\n')
+        response_content_replaced = response_content.replace('\n', '\\n').replace('\r', '\\n')
+        
+        logging.info(
+            f"使用的key: {api_key}, "
+            f"提示token: {prompt_tokens}, "
+            f"输出token: {completion_tokens}, "
+            f"总共用时: {total_time:.4f}秒, "
+            f"使用的模型: {model_name}, "
+            f"用户的内容: {user_content_replaced}, "
+            f"输出的内容: {response_content_replaced}"
+        )
+        
+        # 更新统计信息
+        with data_lock:
+            request_timestamps.append(time.time())
+            token_counts.append(prompt_tokens + completion_tokens)
+            request_timestamps_day.append(time.time())
+            token_counts_day.append(prompt_tokens + completion_tokens)
+        
+        # 如果响应是空的或没有内容，记录警告
+        if not response_content:
+            logging.warning(f"模型 {model_name} 返回了空响应")
+            
+        # 直接返回原始响应，保持与API的一致性
+        return jsonify(response_json)
+        
+    except Exception as e:
+        logging.error(f"处理普通响应时发生错误: {str(e)}")
+        return jsonify({
+            "error": "Response processing error",
+            "details": str(e)
+        }), 500
+
+# 添加OPTIONS请求处理
+@app.route(f'{API_PREFIX}/models', methods=['OPTIONS'])
+@app.route(f'{API_PREFIX}/v1/models', methods=['OPTIONS'])
+def handle_options():
+    response = jsonify({})
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+    return response
 
 if __name__ == '__main__':
-    # 注意：在 Vercel 上部署时，不需要 app.run()。
-    # 这里保留 app.run 是为了方便本地调试
+    logging.info(f"环境变量：{os.environ}")
+    load_keys()
+    logging.info("程序启动时首次加载 keys 已执行")
+    load_model_provider_routing()
+    logging.info("已加载模型提供商路由配置")
+    scheduler.start()
+    logging.info("首次加载 keys 已手动触发执行")
+    refresh_models()
+    logging.info("首次刷新模型列表已手动触发执行")
     app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 7860)))
+
